@@ -443,15 +443,18 @@ class OmniServeCommand(CLISubcommand):
             help="Ring Sequence Parallelism degree for diffusion models. "
             "Equivalent to setting DiffusionParallelConfig.ring_degree.",
         )
-        omni_config_group.add_argument(
-            "--diffusion-quantization-config",
-            type=json.loads,
-            default=None,
-            help=(
-                "JSON string for diffusion quantization_config. "
-                'Example: \'{"method":"gguf","gguf_model":"/path/to/model.gguf"}\'.'
-            ),
-        )
+        try:
+            omni_config_group.add_argument(
+                "--quantization-config",
+                type=json.loads,
+                default=None,
+                help=(
+                    "JSON string for diffusion quantization_config. "
+                    'Example: \'{"method":"gguf","gguf_model":"/path/to/model.gguf"}\'.'
+                ),
+            )
+        except argparse.ArgumentError:
+            pass
         omni_config_group.add_argument(
             "--force-cutlass-fp8",
             action="store_true",

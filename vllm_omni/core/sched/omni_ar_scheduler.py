@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 from time import time
 from typing import Any
 
+import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
@@ -15,7 +16,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.perf import PerfStats
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import ModelRunnerOutput, RoutedExpertsLists
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
@@ -24,13 +25,30 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
 )
-from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
+
+
+def _omni_routed_experts_for_request(routed_experts: RoutedExpertsLists, request) -> np.ndarray | None:
+    """Extract per-request routed experts from RoutedExpertsLists using slot_mapping.
+
+    Matches upstream RoutedExpertsManager.get() pattern — filters routing_data
+    rows whose slot_mapping entries belong to this request's block_table.
+    """
+    if routed_experts is None:
+        return None
+    slots = getattr(request, "block_table", None)
+    if slots is None:
+        return None
+    slot_set = set(slots)
+    mask = np.isin(routed_experts.slot_mapping, list(slot_set))
+    data = routed_experts.routing_data[mask]
+    return data if data.size > 0 else None
+
 
 logger = init_logger(__name__)
 
@@ -424,7 +442,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             if stopped:
                 if model_runner_output.routed_experts is not None:
-                    routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
+                    routed_experts = _omni_routed_experts_for_request(model_runner_output.routed_experts, request)
 
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
