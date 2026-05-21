@@ -897,8 +897,9 @@ class DiffusionEngine:
             if worker_thread.is_alive():
                 logger.warning(
                     "Worker thread did not terminate within 10s; "
-                    "proceeding with scheduler and executor shutdown anyway."
+                    "scheduler and executor shutdown will be deferred."
                 )
+                return
             else:
                 self._loop_started = False
         else:
