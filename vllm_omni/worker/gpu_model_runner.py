@@ -799,14 +799,14 @@ class OmniGPUModelRunner(GPUModelRunner):
             raise ValueError(f"Invalid hidden states type: {type(hidden_states)}")
         return text_hidden_states, multimodal_outputs
 
-    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
         # Models loaded with load_format=dummy (e.g. MossTTSNano) may
         # produce CPU hidden_states while the upstream sampler warmup
         # expects GPU tensors.  Skip the warmup in that case — a
         # meaningful warmup requires real weights anyway.
         if hidden_states.device != self.device:
-            return torch.tensor([])
-        return super()._dummy_sampler_run(hidden_states=hidden_states)
+            return
+        super()._dummy_sampler_run(hidden_states=hidden_states)
 
     @torch.inference_mode()
     def _dummy_run(
