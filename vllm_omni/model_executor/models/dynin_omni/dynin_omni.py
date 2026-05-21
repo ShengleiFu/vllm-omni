@@ -578,6 +578,7 @@ class DyninOmniForConditionalGeneration(nn.Module, SupportsMultiModal):
         impl_cls = self._resolve_stage_impl_class(self.model_stage)
         self.impl = impl_cls(vllm_config=vllm_config, prefix=prefix)
         self.model = self.impl
+            self._mark_language_model(self.model)  # required by upstream SupportsMoE
 
         self.has_preprocess = False
         self.has_postprocess = False

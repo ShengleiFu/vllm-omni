@@ -121,6 +121,7 @@ class VoxtralTTSForConditionalGeneration(
                 architectures=["VoxtralTTSAudioGeneration"],
             )
             self.model = self.audio_generation
+            self._mark_language_model(self.model)  # required by upstream SupportsMoE
             self.audio_tokenizer = None
             self._cudagraph_acoustic_transformer = None
             self._vllm_config = vllm_config
@@ -155,6 +156,7 @@ class VoxtralTTSForConditionalGeneration(
                 architectures=["VoxtralTTSAudioTokenizer"],
             )
             self.model = self.audio_tokenizer
+            self._mark_language_model(self.model)  # required by upstream SupportsMoE
         else:
             raise ValueError("Invalid model stage")
 

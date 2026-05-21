@@ -123,6 +123,7 @@ class MingFlashOmniForConditionalGeneration(
                 architectures=["MingFlashOmniThinkerForConditionalGeneration"],
             )
             self.model = self.thinker
+            self._mark_language_model(self.model)  # required by upstream SupportsMoE
             self.make_empty_intermediate_tensors = self.thinker.make_empty_intermediate_tensors
 
         elif self.model_stage == "imagegen":

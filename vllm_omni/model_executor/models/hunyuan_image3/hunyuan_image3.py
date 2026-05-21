@@ -1497,6 +1497,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self.quant_config = quant_config
         self.vllm_config = vllm_config
         self.model = HunyuanModel(vllm_config=vllm_config, prefix="model")
+        self._mark_language_model(self.model)  # required by upstream SupportsMoE
         if get_pp_group().is_last_rank:
             self.unpadded_vocab_size = config.vocab_size
             self.lm_head = ParallelLMHead(
