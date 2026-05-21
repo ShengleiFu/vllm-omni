@@ -142,6 +142,7 @@ class Qwen2_5OmniForConditionalGeneration(
             self._token2wav_conds: dict[str, torch.Tensor] = {}
             self._token2wav_ref_mels: dict[str, torch.Tensor] = {}
             self.model = self.token2wav
+            self._mark_language_model(self.model)  # required by upstream SupportsMoE
             self.requires_raw_input_tokens = True
         else:
             raise ValueError("Invalid model stage")
