@@ -226,7 +226,6 @@ class CovoAudioForConditionalGeneration(
             )
             self.code2wav = None
             self.model = self.fused_thinker_talker
-            self._mark_language_model(self.model)  # required by upstream SupportsMoE
 
         elif self.model_stage == "code2wav":
             self.code2wav = init_vllm_registered_model(
@@ -235,7 +234,6 @@ class CovoAudioForConditionalGeneration(
             )
             self.fused_thinker_talker = None
             self.model = self.code2wav
-            self._mark_language_model(self.model)  # required by upstream SupportsMoE
         else:
             raise ValueError("Invalid model stage")
 

@@ -469,7 +469,6 @@ class CosyVoice3Model(
             # KV cache is now managed externally by vLLM's PagedAttention
             # No need for self.llm_cache
             self.model = self.talker
-            self._mark_language_model(self.model)  # required by upstream SupportsMoE
         elif self.model_stage == "cosyvoice3_code2wav":
             # Initialize code2wav stage (flow matching + vocoder)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav

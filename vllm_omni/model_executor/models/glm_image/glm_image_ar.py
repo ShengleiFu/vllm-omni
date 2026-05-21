@@ -2449,7 +2449,6 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             vllm_config=vllm_config,
             prefix=f"{prefix}.model" if prefix else "model",
         )
-        self._mark_language_model(self.model)  # required by upstream SupportsMoE
         )
 
         # LM head for token prediction

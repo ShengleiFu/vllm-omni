@@ -723,7 +723,6 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 architectures=["MammothModa2ARForConditionalGeneration"],
             )
             self.model = self.ar
-            self._mark_language_model(self.model)  # required by upstream SupportsMoE
         elif self.model_stage == "dit":
             self.dit = init_vllm_registered_model(
                 vllm_config=vllm_config,
@@ -737,7 +736,6 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 architectures=["MammothModa2DiTPipeline"],
             )
             self.model = self.dit
-            self._mark_language_model(self.model)  # required by upstream SupportsMoE
         elif self.model_stage == "vae":
             # Reserved: VAEs not implemented yet; raise explicit error.
             raise NotImplementedError("MammothModa2 VAE stage not implemented yet.")
