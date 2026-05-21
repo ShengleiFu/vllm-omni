@@ -2449,7 +2449,6 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             vllm_config=vllm_config,
             prefix=f"{prefix}.model" if prefix else "model",
         )
-        )
 
         # LM head for token prediction
         # GLM-Image outputs to vision_vocab_size (16512) not full vocab
