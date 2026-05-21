@@ -141,6 +141,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 architectures=["Qwen3OmniMoeThinkerForConditionalGeneration"],
             )
             self.model = self.thinker
+            self._mark_language_model(self.thinker)  # required by upstream SupportsMoE
             self.talker = None
             self.code2wav = None
             self.tts_tokens = torch.tensor(
@@ -168,6 +169,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 architectures=["Qwen3OmniMoeTalkerForConditionalGeneration"],
             )
             self.model = self.talker
+            self._mark_language_model(self.talker)  # required by upstream SupportsMoE
             self.code2wav = None
 
             # for CI: Initialize special tokens embeddings early to avoid AttributeError when loading dummy weights
@@ -200,6 +202,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 architectures=["Qwen3OmniMoeCode2Wav"],
             )
             self.model = self.code2wav
+            self._mark_language_model(self.code2wav)  # required by upstream SupportsMoE
             self.requires_raw_input_tokens = True
         else:
             raise ValueError(
