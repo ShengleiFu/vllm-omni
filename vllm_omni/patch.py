@@ -167,7 +167,6 @@ _logger.warning(
     "Remove this patch once vLLM adds _STAT_LOGGER_METRIC_NAMES."
 )
 
-
 # Patch: add qwen3_omni_moe to vllm's chat template fallback registry.
 # Qwen/Qwen3-Omni-30B-A3B-Instruct stores its chat_template in a standalone
 # chat_template.json (not in tokenizer_config.json).  transformers < 5.9.0
