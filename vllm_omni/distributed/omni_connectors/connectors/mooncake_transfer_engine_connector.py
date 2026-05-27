@@ -114,7 +114,6 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._listener_ready = threading.Event()
         self._local_buffers: dict[str, Any] = {}
         self._local_buffers_lock = threading.Lock()
-        self._rdma_write_lock = threading.Lock()
         self._req_local = threading.local()
         self._worker_local = threading.local()
         self._last_ttl_check: float = _time_mod.monotonic()
@@ -1040,26 +1039,21 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             src_addrs, src_lengths, _, _, _, _ = item
             remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
 
-            # Serialize RDMA writes to avoid race conditions in the
-            # Mooncake C++ engine when consecutive writes target the
-            # same remote session (observed as flaky MD5 mismatches
-            # in test_concurrent_put_get_threaded_both_sides).
-            with self._rdma_write_lock:
-                # RDMA Write
-                ret = self.engine.batch_transfer_sync_write(remote_session, src_addrs, meta.dst_addrs, src_lengths)
+            # RDMA Write
+            ret = self.engine.batch_transfer_sync_write(remote_session, src_addrs, meta.dst_addrs, src_lengths)
 
-                if ret == 0:
-                    self.cleanup(meta.request_id)
-                    response_queue.put((identity, TRANS_DONE))
-                else:
-                    # Keep buffer in _local_buffers so receiver can retry on transient failures.
-                    # Buffer will be cleaned up when: (a) a retry succeeds, (b) close() is called,
-                    # or (c) a future TTL mechanism reclaims stale entries.
-                    logger.warning(
-                        f"RDMA write failed for {meta.request_id} to {remote_session} "
-                        f"(ret={ret}). Buffer retained for retry."
-                    )
-                    response_queue.put((identity, TRANS_ERROR))
+            if ret == 0:
+                self.cleanup(meta.request_id)
+                response_queue.put((identity, TRANS_DONE))
+            else:
+                # Keep buffer in _local_buffers so receiver can retry on transient failures.
+                # Buffer will be cleaned up when: (a) a retry succeeds, (b) close() is called,
+                # or (c) a future TTL mechanism reclaims stale entries.
+                logger.warning(
+                    f"RDMA write failed for {meta.request_id} to {remote_session} "
+                    f"(ret={ret}). Buffer retained for retry."
+                )
+                response_queue.put((identity, TRANS_ERROR))
 
         except Exception as e:
             logger.error(f"Push failed: {e}")
