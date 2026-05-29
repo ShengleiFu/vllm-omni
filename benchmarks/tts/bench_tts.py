@@ -133,6 +133,12 @@ def build_bench_args(
     if task_extra_body:
         cmd += ["--extra-body", json.dumps(task_extra_body, separators=(",", ":"))]
 
+<<<<<<< HEAD
+=======
+    # vllm 0.22's get_tokenizer eagerly resolves tokenizer_args via
+    # AutoTokenizer.from_pretrained, which fails on custom-code models unless
+    # --trust-remote-code is set. Honor a per-model flag in model_configs.yaml.
+>>>>>>> 17267f28 (fix(bench): pass --trust-remote-code for custom-code TTS models)
     if model_cfg.get("trust_remote_code"):
         cmd.append("--trust-remote-code")
 
