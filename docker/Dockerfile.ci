@@ -14,6 +14,7 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+<<<<<<< HEAD
 
 # Install vLLM (CUDA 13.0 build) from precompiled wheel at the selected commit.
 # Must use direct URL because the wheel has a PEP 440 local version identifier
@@ -33,23 +34,9 @@ RUN VLLM_WHEEL_URL=$(python3 -c "import urllib.request,re; \
 
 
 
+=======
+>>>>>>> 41bf877d ([Docker] Update vLLM base tag to v0.22.0 and remove deprecated installation steps)
 RUN uv pip install --system ".[dev]"
-
-RUN uv pip install --system --upgrade \
-        "flashinfer-python==0.6.11.post2" \
-        "flashinfer-cubin==0.6.11.post2" \
-        "numpy==2.2.6"
-
-RUN uv pip install --system --upgrade \
-    "flashinfer-jit-cache==0.6.11.post2" \
-    --index-url https://flashinfer.ai/whl/cu130
-
-# Force-reinstall torch AFTER flashinfer, because flashinfer --upgrade pulls in
-# a newer torch (2.12.x) whose libtorch_cuda.so lacks
-# at::cuda::getCurrentCUDABlasHandle, causing "undefined symbol" at import time.
-RUN uv pip install --system --force-reinstall \
-    "torch==2.11.0" "torchaudio==2.11.0" "torchvision==0.26.0" \
-    --torch-backend cu130
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
