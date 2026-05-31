@@ -182,6 +182,8 @@ class ImageGenerationResponse(BaseModel):
         description="Chain-of-thought text output from the AR stage. "
         "Only present for image editing (IT2I) with CoT-enabled models.",
     )
+
+
 class ImageEditARDeltaChunk(BaseModel):
     """Streaming chunk carrying a text delta from the image-edit AR stage."""
 
