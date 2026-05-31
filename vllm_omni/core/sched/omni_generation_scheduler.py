@@ -4,7 +4,6 @@ import time
 from collections import defaultdict
 from typing import Any
 
-import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
@@ -26,6 +25,7 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
@@ -38,17 +38,6 @@ from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
 
 
-def _omni_routed_experts_for_request(routed_experts: RoutedExpertsLists, request) -> np.ndarray | None:
-    """Extract per-request routed experts from RoutedExpertsLists using slot_mapping."""
-    if routed_experts is None:
-        return None
-    slots = getattr(request, "block_table", None)
-    if slots is None:
-        return None
-    slot_set = set(slots)
-    mask = np.isin(routed_experts.slot_mapping, list(slot_set))
-    data = routed_experts.routing_data[mask]
-    return data if data.size > 0 else None
 
 
 logger = init_logger(__name__)
@@ -535,7 +524,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             if stopped:
                 if model_runner_output.routed_experts is not None:
-                    routed_experts = _omni_routed_experts_for_request(model_runner_output.routed_experts, request)
+                    routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if not finished:
