@@ -359,8 +359,7 @@ def prefetch_subfolders(
             if attempt < _PREFETCH_MAX_ATTEMPTS:
                 backoff = _PREFETCH_BACKOFF_BASE_S * attempt
                 logger.warning(
-                    "Hub prefetch for repo '%s' subfolders %s failed on attempt "
-                    "%d/%d (%s: %s); retrying in %.1fs",
+                    "Hub prefetch for repo '%s' subfolders %s failed on attempt %d/%d (%s: %s); retrying in %.1fs",
                     model,
                     subfolders,
                     attempt,
