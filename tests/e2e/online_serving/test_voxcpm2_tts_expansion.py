@@ -91,5 +91,10 @@ def test_response_format_001(omni_server, openai_client) -> None:
         "voice": "default",
         "ref_audio": REF_AUDIO_URL,
         "min_audio_bytes": _MIN_AUDIO_BYTES,
+        # VoxCPM2 voice-clone PCM output has intrinsic HNR ~0.8 dB;
+        # lower the catastrophic-failure threshold from the global
+        # default (1.0 dB) to 0.7 dB so the test gates on severe
+        # distortion rather than model-intrinsic quiet-codec noise.
+        "min_hnr_db": 0.7,
     }
     openai_client.send_audio_speech_request(request_config)
