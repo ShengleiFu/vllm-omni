@@ -20,7 +20,7 @@ RUN apt-get update && \
 # (e.g. +gaeee7ef93.cu130) which pip/uv refuse to install from a PEP 503 package index.
 # The cu130 wheel index lives at /<commit>/cu130/vllm/ but the actual wheel files
 # are stored at the top level /<commit>/<wheel>.
-ENV VLLM_PRECOMPILED_WHEEL_COMMIT=0cbc48c4f98873acb88ab220db4540ffe99cbc1e
+ENV VLLM_PRECOMPILED_WHEEL_COMMIT=597bc1593635b2f5ee841b3b9162af64a04d2d28
 RUN VLLM_WHEEL_URL=$(python3 -c "import urllib.request,re; \
     from urllib.parse import urljoin, quote; \
     index_url='https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/cu130/vllm/'; \
@@ -36,12 +36,12 @@ RUN VLLM_WHEEL_URL=$(python3 -c "import urllib.request,re; \
 RUN uv pip install --system ".[dev]"
 
 RUN uv pip install --system --upgrade \
-        "flashinfer-python==0.6.11.post2" \
-        "flashinfer-cubin==0.6.11.post2" \
+        "flashinfer-python==0.6.12" \
+        "flashinfer-cubin==0.6.12" \
         "numpy==2.2.6"
 
 RUN uv pip install --system --upgrade \
-    "flashinfer-jit-cache==0.6.11.post2" \
+    "flashinfer-jit-cache==0.6.12" \
     --index-url https://flashinfer.ai/whl/cu130
 
 # Force-reinstall torch AFTER flashinfer, because flashinfer --upgrade pulls in
