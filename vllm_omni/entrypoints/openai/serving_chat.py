@@ -842,6 +842,27 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if value is not None and hasattr(obj, key):
                 setattr(obj, key, value)
 
+    def _should_check_for_unstreamed_tool_arg_tokens(
+        self,
+        delta_message: Any,
+        output: Any,
+    ) -> bool:
+        """Check whether the streaming generator should flush unstreamed
+        tool-arg tokens at finish-time.
+
+        This method was moved from OpenAIServingChat to the tool-parser layer
+        by upstream commit 9affc17a05.  Omni's independently-maintained
+        ``chat_completion_stream_generator`` still calls it, so we keep a
+        local copy with the pre-9affc17a05 semantics.
+        """
+        return (
+            output.finish_reason is not None
+            and self.enable_auto_tools
+            and self.tool_parser is not None
+            and delta_message is not None
+            and delta_message.tool_calls
+        )
+
     def _build_sampling_params_list_from_request(
         self,
         request: ChatCompletionRequest,

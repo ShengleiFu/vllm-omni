@@ -1193,6 +1193,7 @@ async def benchmark(
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
     ssl_context: ssl.SSLContext | bool | None = None,
+    self_timed: bool = False,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -1355,6 +1356,7 @@ async def benchmark(
         ramp_up_strategy,
         ramp_up_start_rps,
         ramp_up_end_rps,
+        self_timed,
     ):
         if ramp_up_strategy is not None:
             current_int_rps = int(current_request_rate)
