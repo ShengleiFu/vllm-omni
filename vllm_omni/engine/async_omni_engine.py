@@ -2492,6 +2492,7 @@ class AsyncOmniEngine:
         # keeping a CPU backup when the engine is being torn down.
         try:
             from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
+
             if cumem_available:
                 allocator = CuMemAllocator.get_instance()
                 # Sleep at level 2 discards all pool memory from the GPU
