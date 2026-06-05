@@ -232,6 +232,51 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self._capture_talker_mtp_graphs()
         return result
 
+    def shutdown(self) -> None:
+        """Release omni-specific GPU resources before upstream shutdown.
+
+        Order of operations (must match upstream's expectation):
+          1. Destroy omni-specific CUDA graphs (talker MTP) so references to
+             model parameters are released before self.model = None.
+          2. Clear GPU-side buffers (input_ids, inputs_embeds) and per-request
+             caches that may hold GPU tensor references.
+          3. Call CUDAGraphWrapper.clear_all_graphs() unconditionally (not just
+             on ROCm) to ensure all CUDA graphs including talker MTP are
+             released before model weight teardown.
+          4. Delegate to upstream GPUModelRunner.shutdown() which sets
+             self.model = None, clears KV caches, resets workspace, etc.
+
+        This prevents abrupt GPU memory release during EngineCore subprocess
+        exit that can trigger GPU OOM signals when the parent process
+        concurrently cleans up its own GPU state.
+        """
+        # 1. Destroy talker MTP CUDA graph wrapper to release captured graphs.
+        if hasattr(self, "talker_mtp") and self.talker_mtp is not None:
+            self.talker_mtp = None
+        self.has_talker_mtp = False
+
+        # 2. Clear GPU-side buffers (small tensors, but every MiB helps).
+        if hasattr(self, "input_ids") and self.input_ids is not None:
+            self.input_ids = None
+        if hasattr(self, "inputs_embeds") and self.inputs_embeds is not None:
+            self.inputs_embeds = None
+
+        # 3. Clear per-request caches that may hold GPU tensor references.
+        if hasattr(self, "_downstream_payload_cache"):
+            self._downstream_payload_cache.clear()
+        if hasattr(self, "model_intermediate_buffer"):
+            self.model_intermediate_buffer.clear()
+
+        # 4. Release all CUDA graphs unconditionally (upstream only does this
+        #    on ROCm; on CUDA the graphs are only freed by Python GC during
+        #    interpreter shutdown, which is too late to prevent memory spikes).
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+
+        CUDAGraphWrapper.clear_all_graphs()
+
+        # 5. Delegate to upstream shutdown (model = None, KV caches, workspace).
+        super().shutdown()
+
     def _capture_talker_mtp_graphs(self) -> None:
         from vllm.compilation.cuda_graph import CUDAGraphWrapper
 

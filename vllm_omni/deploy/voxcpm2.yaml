@@ -8,11 +8,11 @@ dtype: bfloat16
 
 stages:
   - stage_id: 0
-    max_num_seqs: 32
-    gpu_memory_utilization: 0.9
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.85
     # Right-size the KV cache instead of letting it fill gpu_memory_utilization.
-    # max_num_seqs(32) * max_model_len(4096) ~= 131k tokens; 6 GiB holds ~175k
-    # (42x concurrency, above the 32-seq scheduler cap, so no throughput loss).
+    # max_num_seqs(4) * max_model_len(4096) ~= 16k tokens; 6 GiB holds ~175k
+    # (well above the 4-seq CI cap, so no throughput loss from KV cache limits).
     # The remaining VRAM stays free for the VoxCPM2 diffusion side-path
     # (LocDiT / AudioVAE / code2wav + batch CUDA-graph pools), which allocates
     # outside vLLM's KV accounting during inference. Keeps peak ~13 GiB on any
@@ -31,7 +31,7 @@ stages:
       hf_overrides:
         voxcpm2_runtime_config:
           audio_emit_every: 1
-          vae_decode_every: 3
+          vae_decode_every: 1
           enable_batched_cfm: true
           enable_batched_vae_decode: true
           coalesce_audio_d2h: true
