@@ -20,7 +20,7 @@ RUN apt-get update && \
 # (e.g. +gaeee7ef93.cu130) which pip/uv refuse to install from a PEP 503 package index.
 # The cu130 wheel index lives at /<commit>/cu130/vllm/ but the actual wheel files
 # are stored at the top level /<commit>/<wheel>.
-ENV VLLM_PRECOMPILED_WHEEL_COMMIT=f87df1df9e93042fcfbd939d5fab0b7b0f47abc8
+ENV VLLM_PRECOMPILED_WHEEL_COMMIT=1505b3d8a1f31be16fc6ff37494c15651bbf1fa2
 RUN VLLM_WHEEL_URL=$(python3 -c "import urllib.request,re; \
     from urllib.parse import urljoin, quote; \
     index_url='https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/cu130/vllm/'; \
