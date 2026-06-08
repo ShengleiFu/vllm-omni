@@ -4,7 +4,6 @@
 from typing import Any
 
 import vllm.forward_context as _vllm_fc
-from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.platforms import current_omni_platform
@@ -25,22 +24,41 @@ def _set_forward_context_num_tokens(num_tokens: int) -> None:
         forward_context.in_profile_run = False
 
 
-class HunyuanFusedMoEDefault(FusedMoE):
+class HunyuanFusedMoEDefault:
+    """Wrapper around the upstream MoERunner for HunyuanImage3.
+
+    Upstream commit dc68bd8c41 refactored FusedMoE from a class (``nn.Module``)
+    to a factory function that returns a ``MoERunner`` instance.  This wrapper
+    adapts the old subclass interface to the new factory API while preserving
+    the omni-specific forward-context setup and kernel-initialisation hook.
+    """
+
     def __init__(self, *, prefix: str = "", **kwargs: Any) -> None:
         # Current vLLM FusedMoE handles output reduction internally.
         kwargs.pop("reduce_results", None)
-        super().__init__(prefix=prefix, **kwargs)
+        # FusedMoE is now a factory function — call it to get a MoERunner.
+        from vllm.model_executor.layers.fused_moe import FusedMoE as _FusedMoE
+
+        self._moe_runner = _FusedMoE(prefix=prefix, **kwargs)
         self._prefix = prefix
-        self._init_hook_handle = self.register_forward_pre_hook(self._initialize_kernel_hook, with_kwargs=True)
+        # Install the kernel-init hook on the inner MoERunner (which is a
+        # proper nn.Module).
+        self._init_hook_handle = self._moe_runner.register_forward_pre_hook(
+            self._initialize_kernel_hook, with_kwargs=True
+        )
 
     def _initialize_kernel_hook(self, module: Any, args: Any, kwargs: Any) -> None:
-        if self.quant_method and getattr(self.quant_method, "moe_kernel", None) is None:
-            self.quant_method.process_weights_after_loading(self)
+        if (
+            hasattr(self._moe_runner, "quant_method")
+            and self._moe_runner.quant_method is not None
+            and getattr(self._moe_runner.quant_method, "moe_kernel", None) is None
+        ):
+            self._moe_runner.quant_method.process_weights_after_loading(self._moe_runner)
         self._init_hook_handle.remove()
 
     def forward(self, hidden_states: Any, router_logits: Any) -> Any:
         _set_forward_context_num_tokens(hidden_states.shape[0])
-        return super().forward(hidden_states, router_logits)
+        return self._moe_runner(hidden_states=hidden_states, router_logits=router_logits)
 
 
 class HunyuanFusedMoE:
