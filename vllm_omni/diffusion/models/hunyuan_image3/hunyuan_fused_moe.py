@@ -56,6 +56,36 @@ class HunyuanFusedMoEDefault:
             self._moe_runner.quant_method.process_weights_after_loading(self._moe_runner)
         self._init_hook_handle.remove()
 
+    @staticmethod
+    def make_expert_params_mapping(
+        model: Any,
+        ckpt_gate_proj_name: str,
+        ckpt_down_proj_name: str,
+        ckpt_up_proj_name: str,
+        num_experts: int,
+        num_redundant_experts: int = 0,
+    ) -> list[tuple[str, str, int, str]]:
+        """Delegate to the upstream standalone function.
+
+        Upstream vLLM refactored ``FusedMoE`` from a class (which had
+        ``make_expert_params_mapping`` as a classmethod) to a factory
+        function.  The method was moved to a standalone function
+        ``fused_moe_make_expert_params_mapping`` in
+        ``vllm.model_executor.layers.fused_moe``.
+        """
+        from vllm.model_executor.layers.fused_moe import (
+            fused_moe_make_expert_params_mapping,
+        )
+
+        return fused_moe_make_expert_params_mapping(
+            model,
+            ckpt_gate_proj_name=ckpt_gate_proj_name,
+            ckpt_down_proj_name=ckpt_down_proj_name,
+            ckpt_up_proj_name=ckpt_up_proj_name,
+            num_experts=num_experts,
+            num_redundant_experts=num_redundant_experts,
+        )
+
     def forward(self, hidden_states: Any, router_logits: Any) -> Any:
         _set_forward_context_num_tokens(hidden_states.shape[0])
         return self._moe_runner(hidden_states=hidden_states, router_logits=router_logits)
