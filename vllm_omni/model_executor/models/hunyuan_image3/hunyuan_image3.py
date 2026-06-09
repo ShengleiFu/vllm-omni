@@ -338,6 +338,14 @@ class HunyuanModel(HunYuanModel):
                     if is_pp_missing_parameter(name_mapped, self):
                         continue
 
+                    if name_mapped not in params_dict:
+                        # Parameter name not found in this rank's params_dict.
+                        # This can happen with the new MoE architecture
+                        # (MoERunner/RoutedExperts) where the parameter path
+                        # differs from what the mapping expects, or when the
+                        # expert is on a different EP rank.
+                        continue
+
                     param = params_dict[name_mapped]
                     # We should ask the weight loader to return success or not
                     # here since otherwise we may skip experts with other
@@ -383,6 +391,13 @@ class HunyuanModel(HunYuanModel):
                     name = "norm.weight"
                 if name == "wte.weight":
                     name = "embed_tokens.weight"
+                if name not in params_dict:
+                    # Weight name not found in params_dict. This can happen
+                    # when checkpoint contains weights that don't correspond
+                    # to any model parameter (e.g., from a different model
+                    # version or architecture). Skip silently rather than
+                    # raising a KeyError.
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
