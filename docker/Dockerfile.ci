@@ -21,6 +21,12 @@ RUN apt-get update && \
 # The cu130 wheel index lives at /<commit>/cu130/vllm/ but the actual wheel files
 # are stored at the top level /<commit>/<wheel>.
 ENV VLLM_PRECOMPILED_WHEEL_COMMIT=ba94a3b9989666f950e1f784d18f2033c63c6cad
+# Ensure CUDA library path is in LD_LIBRARY_PATH so bitsandbytes' precompiled
+# C extension can find libnvJitLink.so.13 (CUDA 13.x JIT linker) at import time.
+# The base vLLM image has bitsandbytes pre-installed; without this env var,
+# worker subprocesses fail to load bitsandbytes' C extension, producing
+# OSError tracebacks that pollute CI logs.
+ENV LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH}
 RUN VLLM_WHEEL_URL=$(python3 -c "import urllib.request,re; \
     from urllib.parse import urljoin, quote; \
     index_url='https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/cu130/vllm/'; \
