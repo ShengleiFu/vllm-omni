@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import MoERunner
+from vllm.model_executor.layers.fused_moe.layer import MoERunner
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3_moe import (
