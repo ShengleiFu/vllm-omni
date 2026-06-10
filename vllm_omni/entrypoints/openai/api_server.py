@@ -274,7 +274,8 @@ def _register_omni_exception_handlers(app) -> None:
 
     - Log multi-stage diagnostic info (orchestrator liveness, per-stage health)
       when an ``EngineDeadError`` is caught.
-    - Call ``terminate_if_errored``
+    - Terminate the server only when the orchestrator is dead; a single dead
+      stage keeps the API alive so later requests still get the 5xx contract.
     - Return an OpenAI-compatible error JSON response.
     """
 
@@ -331,13 +332,31 @@ def _create_engine_error_json_response(
             error_stage_id,
         )
 
-    terminate_if_errored(
+    _maybe_terminate_on_engine_error(
         server=req.app.state.server,
-        engine=engine,
+        engine_client=engine,
     )
 
     payload, status_code = _build_engine_error_payload(exc, request_id=request_id)
     return JSONResponse(content=payload, status_code=status_code)
+
+
+def _maybe_terminate_on_engine_error(server, engine_client) -> None:
+    """Omni-aware guard around upstream ``terminate_if_errored``.
+
+    Omni marks ``errored`` when *any* stage engine has died (e.g. a CUDA OOM
+    in one stage), but the orchestrator can still route requests: subsequent
+    calls fast-fail with ``EngineDeadError`` and ``/health`` reports 503.
+    Exiting uvicorn in that state would replace the OpenAI error contract
+    with connection-refused for every later request, so fall through to the
+    upstream termination policy only when the orchestrator thread itself is
+    gone (or its liveness cannot be determined).
+    """
+    orchestrator = getattr(engine_client, "engine", None)
+    is_alive = getattr(orchestrator, "is_alive", None)
+    if callable(is_alive) and is_alive():
+        return
+    terminate_if_errored(server=server, engine=engine_client)
 
 
 class _DiffusionServingModels:
@@ -2735,11 +2754,13 @@ async def _run_video_generation_job(
             },
         )
         # Background tasks can't propagate exceptions to FastAPI handlers.
-        # Actively signal shutdown when the engine is dead.
+        # Apply the same orchestrator-gated termination policy as the
+        # request path; the failure is already surfaced to clients via
+        # the video store status.
         if app_state is not None and isinstance(exc, EngineDeadError):
-            terminate_if_errored(
+            _maybe_terminate_on_engine_error(
                 server=app_state.server,
-                engine=app_state.engine_client,
+                engine_client=app_state.engine_client,
             )
     except Exception as exc:
         logger.exception("Video generation failed for id=%s", video_id)

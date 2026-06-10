@@ -319,7 +319,6 @@ QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, DEPLO
 
 
 @pytest.mark.slow
-@pytest.mark.skip(reason="issue#4285")
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
@@ -388,7 +387,6 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
 
 
 @pytest.mark.slow
-@pytest.mark.skip(reason="issue#4285")
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_function, openai_client_function) -> None:
@@ -431,7 +429,6 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_functi
 
 
 @pytest.mark.slow
-@pytest.mark.skip(reason="issue#4285")
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_function, openai_client_function) -> None:
@@ -774,7 +771,6 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
 
 
 @pytest.mark.slow
-@pytest.mark.skip(reason="issue#4285")
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
