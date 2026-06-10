@@ -108,6 +108,35 @@ def test_initialization_with_multimodal():
         assert mm_outputs[mm_key].dtype == cache_tensor.dtype
 
 
+def test_oversized_mm_cache_key_skipped_unless_required(monkeypatch):
+    """Oversized keys are dropped by the size cap unless declared required.
+
+    Required keys (e.g. qwen3-omni thinker's hidden_states.layer_N, which feed
+    the talker's full-prompt conditioning) must be cached even when oversized,
+    otherwise prefix-cache-hit requests ship truncated payloads downstream.
+    """
+    monkeypatch.setattr("vllm_omni.core.prefix_cache._MAX_MM_CACHE_BYTES_PER_KEY", 1)
+    cache = OmniTensorPrefixCache(
+        num_blocks=NUM_BLOCKS,
+        block_size=BLOCK_SIZE,
+        hidden_size=HIDDEN_SIZE,
+        hs_dtype=DTYPE,
+        required_mm_cache_keys={"hidden_states.layer_0"},
+    )
+    mm_outputs = get_multimodal_outputs(
+        {"hidden_states.layer_0": 8, "optional_key": 8},
+        seq_len=DEFAULT_SEQ_LEN,
+    )
+    cache.maybe_init_missing_mm_cache_keys(mm_outputs, DEFAULT_SEQ_LEN)
+
+    # Required key bypasses the cap and gets a real CPU cache tensor.
+    assert "hidden_states.layer_0" in cache.mm_cache_keys
+    assert cache.mm_outputs_cache["hidden_states.layer_0"].shape[-1] == 8
+    # Non-required oversized key is still skipped.
+    assert "optional_key" not in cache.mm_cache_keys
+    assert "optional_key" in cache._mm_oversized_keys
+
+
 def test_init_missing_mm_cache_keys_is_idempotent():
     """Ensure that the cache doesn't reinitialize old keys."""
     cache = get_omni_pcache()

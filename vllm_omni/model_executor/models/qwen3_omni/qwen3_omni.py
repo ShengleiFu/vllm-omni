@@ -143,6 +143,17 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.model = self.thinker
             self.talker = None
             self.code2wav = None
+            # The captured embedding layer (layer_0) and accept_hidden_layer
+            # rows are packed into the thinker->talker payload and must cover
+            # the FULL prompt. On prefix-cache hits the cached prefix rows are
+            # reconstructed from OmniTensorPrefixCache, so these keys must
+            # never be dropped by its per-key size cap; otherwise the talker
+            # receives a truncated embed.prefill and crashes in
+            # _get_talker_assistant_parts (tensor size mismatch 6 vs 9).
+            self.required_prefix_cache_mm_keys = {"hidden_states.layer_0"}
+            accept_layer = getattr(talker_config, "accept_hidden_layer", None)
+            if accept_layer is not None:
+                self.required_prefix_cache_mm_keys.add(f"hidden_states.layer_{int(accept_layer)}")
             self.tts_tokens = torch.tensor(
                 [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
                 device=self._module_device(self.thinker),

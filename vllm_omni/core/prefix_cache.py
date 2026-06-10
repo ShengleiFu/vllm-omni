@@ -37,10 +37,17 @@ class OmniTensorPrefixCache:
         block_size: int,
         hidden_size: int,
         hs_dtype: torch.dtype,
+        required_mm_cache_keys: set[str] | None = None,
     ):
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.default_hidden_size = hidden_size
+        # Keys that downstream stages need for *correctness* on prefix-cache
+        # hits (e.g. qwen3-omni thinker's hidden_states.layer_N feed the
+        # talker's full-prompt conditioning). These bypass the per-key size
+        # cap: dropping them would silently truncate the next stage's payload
+        # for any request with a prefix-cache hit.
+        self.required_mm_cache_keys: set[str] = set(required_mm_cache_keys or ())
 
         # Initialize the hidden states cache immediately
         self.hidden_states_cache = self._get_cache_tensor(dtype=hs_dtype)
@@ -80,16 +87,28 @@ class OmniTensorPrefixCache:
             ):
                 feat_dim = val.shape[-1]
                 # Bound per-key cache to avoid OOM on wide per-token features.
+                # Keys declared as required by the model are exempt: skipping
+                # them breaks downstream-stage payloads on prefix-cache hits.
                 key_bytes = self.num_blocks * self.block_size * feat_dim * val.element_size()
                 if key_bytes > _MAX_MM_CACHE_BYTES_PER_KEY:
-                    logger.warning_once(
-                        "Skipping mm prefix cache key '%s': %.1f MiB > %.1f MiB cap.",
-                        key,
-                        key_bytes / 2**20,
-                        _MAX_MM_CACHE_BYTES_PER_KEY / 2**20,
-                    )
-                    self._mm_oversized_keys.add(key)
-                    continue
+                    if key in self.required_mm_cache_keys:
+                        logger.warning_once(
+                            "mm prefix cache key '%s' exceeds the %.1f MiB cap "
+                            "(%.1f MiB) but is required for downstream-stage "
+                            "correctness; allocating it on CPU anyway.",
+                            key,
+                            _MAX_MM_CACHE_BYTES_PER_KEY / 2**20,
+                            key_bytes / 2**20,
+                        )
+                    else:
+                        logger.warning_once(
+                            "Skipping mm prefix cache key '%s': %.1f MiB > %.1f MiB cap.",
+                            key,
+                            key_bytes / 2**20,
+                            _MAX_MM_CACHE_BYTES_PER_KEY / 2**20,
+                        )
+                        self._mm_oversized_keys.add(key)
+                        continue
                 self.mm_outputs_cache[key] = self._get_cache_tensor(
                     dtype=val.dtype,
                     hidden_size=feat_dim,

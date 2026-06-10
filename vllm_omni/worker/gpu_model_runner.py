@@ -133,11 +133,16 @@ class OmniGPUModelRunner(GPUModelRunner):
         # Initialize the wrapper for both multimodal output tensors
         # and for hidden states to be passed between stages
         if self.cache_config.enable_prefix_caching:
+            # Models can declare mm-output keys that the next stage needs in
+            # full on prefix-cache hits (flattened names, e.g.
+            # "hidden_states.layer_0"); those keys bypass the per-key size cap.
+            required_mm_keys = set(getattr(getattr(self, "model", None), "required_prefix_cache_mm_keys", ()) or ())
             self.omni_prefix_cache = OmniTensorPrefixCache(
                 num_blocks=kv_cache_config.num_blocks,
                 block_size=self.cache_config.block_size,
                 hidden_size=self.model_config.get_hidden_size(),
                 hs_dtype=self.dtype,
+                required_mm_cache_keys=required_mm_keys,
             )
 
     @instrument(span_name="Loading (GPU)")
