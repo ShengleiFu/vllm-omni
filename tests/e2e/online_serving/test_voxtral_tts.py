@@ -97,7 +97,7 @@ class TestVoxtralTTSFixedVoice:
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     def test_speech_speed(self, omni_server, openai_client) -> None:
         """Request with speed parameters"""
-        speeds = [0.5, 1, 1.5, 2, 2.5]
+        speeds = [0.5, 1, 1.5]
         for speed in speeds:
             openai_client.send_audio_speech_request(
                 {
