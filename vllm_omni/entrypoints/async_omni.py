@@ -666,17 +666,27 @@ class AsyncOmni(EngineClient, OmniBase):
                         await self.event_resolver.resolve(msg)
                         continue
 
-                    if isinstance(msg, ErrorMessage) and not msg.fatal:
-                        req_state = self.request_states.get(msg.request_id)
-                        if req_state is not None:
-                            await req_state.queue.put(msg)
-                        else:
-                            logger.warning(
-                                "[%s] dropping non-fatal error for unknown req %s",
-                                self._name,
-                                msg.request_id,
-                            )
-                        continue
+                    if isinstance(msg, ErrorMessage):
+                        # Route request-scoped errors to that request's queue and
+                        # keep the loop alive. A request whose stage replica died
+                        # and was evicted gets a fatal error delivered here; only
+                        # that request fails (its consumer raises), the server
+                        # stays up for other stages/requests (#4285). A fatal
+                        # error without a request_id is a genuine engine-wide
+                        # death and falls through to the except handler below.
+                        if msg.request_id is not None:
+                            req_state = self.request_states.get(msg.request_id)
+                            if req_state is not None:
+                                await req_state.queue.put(msg)
+                            else:
+                                logger.warning(
+                                    "[%s] dropping error for unknown req %s",
+                                    self._name,
+                                    msg.request_id,
+                                )
+                            continue
+                        if not msg.fatal:
+                            continue
 
                     should_continue, _, stage_id, req_state = self._handle_output_message(msg)
                     if should_continue:

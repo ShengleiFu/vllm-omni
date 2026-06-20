@@ -221,14 +221,39 @@ class OmniBase(PDDisaggregationMixin):
         """Expose engine stage configs for PD disaggregation detection and validation."""
         return self.engine.stage_configs
 
+    @staticmethod
+    def _replica_is_dead(client: Any) -> bool:
+        if client is None:
+            return True
+        if getattr(client, "_engine_dead", False):
+            return True
+        resources = getattr(client, "resources", None)
+        return resources is not None and getattr(resources, "engine_dead", False)
+
+    def _live_replica_count(self, pool: Any) -> int:
+        """Number of replicas in ``pool`` that are neither evicted nor dead.
+
+        A dead replica is evicted from its pool (slot set to ``None`` in
+        ``StagePool.clients``); a replica that died but has not been evicted
+        yet still carries an ``engine_dead`` flag. Both are excluded.
+        """
+        return sum(1 for client in pool.clients if not self._replica_is_dead(client))
+
+    def _stage_has_no_live_replica(self, pool: Any) -> bool:
+        """True when a non-empty stage pool has lost all of its replicas."""
+        return len(pool.clients) > 0 and self._live_replica_count(pool) == 0
+
     def _has_dead_stage(self) -> bool:
-        for stage_client in self.engine.stage_clients:
-            if getattr(stage_client, "_engine_dead", False):
-                return True
-            resources = getattr(stage_client, "resources", None)
-            if resources is not None and getattr(resources, "engine_dead", False):
-                return True
-        return False
+        """True when any stage has lost all its replicas.
+
+        A single dead replica with surviving replicas does not mark the whole
+        engine errored, so the API server stays up and only requests routed
+        through the dead replica fail (per-replica fault isolation, #4285).
+        """
+        pools = getattr(self.engine, "stage_pools", None)
+        if pools is None:
+            return False
+        return any(self._stage_has_no_live_replica(pool) for pool in pools)
 
     @property
     def is_running(self) -> bool:
@@ -238,21 +263,21 @@ class OmniBase(PDDisaggregationMixin):
     def errored(self) -> bool:
         """Whether the engine is in a non-recoverable error state.
 
-        True when the orchestrator thread is dead **or** any stage client
-        has been marked dead (e.g. diffusion worker OOM / process death).
-
-        Checks both ``_engine_dead`` (StageDiffusionClient) and
-        ``resources.engine_dead`` (StageEngineCoreClient / AsyncMPClient)
-        since the two client types store the flag differently.
+        True when the orchestrator thread is dead **or** any stage has lost
+        all of its replicas. A stage that still has at least one live replica
+        is not an error state (per-replica fault isolation, #4285).
         """
         return not self.engine.is_alive() or self._has_dead_stage()
 
     def check_health(self) -> None:
         if not self.engine.is_alive():
             raise EngineDeadError("Orchestrator process is not alive")
-        for stage_client in self.engine.stage_clients:
-            if hasattr(stage_client, "check_health"):
-                stage_client.check_health()
+        pools = getattr(self.engine, "stage_pools", None)
+        if pools is None:
+            return
+        for pool in pools:
+            if self._stage_has_no_live_replica(pool):
+                raise EngineDeadError(f"Stage-{pool.stage_id} has no live replica")
 
     def resolve_sampling_params_list(
         self,

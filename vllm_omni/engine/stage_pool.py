@@ -1176,3 +1176,18 @@ class StagePool:
                 replica_id,
                 e,
             )
+
+    def evict_replica(self, replica_id: int) -> None:
+        """Shut down a replica and remove it from the live set.
+
+        After eviction ``live_replica_ids`` / ``live_num_replicas`` no longer
+        include this slot, so the orchestrator stops polling and dispatching to
+        it (per-replica fault isolation). The slot is left as a ``None`` hole,
+        consistent with ``num_replicas``.
+        """
+        # replica_id always comes from live_replica_ids() (a valid, live index);
+        # assert the invariant rather than silently no-op'ing an out-of-range id,
+        # which would leave a dead replica in the live set and break isolation.
+        assert 0 <= replica_id < len(self.clients), f"evict_replica: replica_id {replica_id} out of range"
+        self.shutdown_replica(replica_id)
+        self.clients[replica_id] = None

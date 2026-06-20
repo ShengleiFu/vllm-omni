@@ -183,8 +183,6 @@ class Orchestrator:
 
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
-        self._fatal_error: str | None = None
-        self._fatal_error_stage_id: int | None = None
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
@@ -282,12 +280,11 @@ class Orchestrator:
         except asyncio.CancelledError:
             raise
         except EngineDeadError as e:
-            # EngineDeadError from _orchestration_loop means the diffusion
-            # engine died.  All pending requests were already notified and
-            # _shutdown_event was already set by the loop's handler.
-            # During teardown this is expected; the finally block handles
-            # proper cleanup.  Do not re-raise.
-            logger.info("[Orchestrator] Engine dead during shutdown: %s", e)
+            # The orchestration loop isolates per-replica EngineDeadError
+            # (evict + continue), so this only fires if one escapes outside the
+            # poll handler (e.g. from output post-processing). Treat it as a
+            # teardown signal and let the finally block clean up; do not re-raise.
+            logger.info("[Orchestrator] Engine dead, shutting down: %s", e)
         except Exception:
             logger.exception("[Orchestrator] Fatal error in orchestrator tasks")
             raise
@@ -300,9 +297,6 @@ class Orchestrator:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except Exception:
                 pass
-
-            if self._fatal_error is not None:
-                await self._drain_pending_requests_on_fatal()
 
             if self._membership is not None:
                 await self._membership.drain_tasks(timeout=10.0)
@@ -368,6 +362,26 @@ class Orchestrator:
             raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
         final_stage_id = msg.final_stage_id
         final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
+
+        if not self.stage_pools[stage_id].live_replica_ids():
+            # Stage 0 lost all replicas between the HTTP-layer errored check and
+            # dispatch. Fail the request instead of raising (which would kill the
+            # request handler task and tear down the server). #4285. Done before
+            # registering request state / running counter so nothing leaks.
+            logger.error(
+                "[Orchestrator] req=%s: stage-%d has no live replica; failing the request",
+                request_id,
+                stage_id,
+            )
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    error=f"Stage-{stage_id} has no live replica",
+                    fatal=True,
+                    request_id=request_id,
+                    stage_id=stage_id,
+                )
+            )
+            return
 
         logger.debug(
             "[Orchestrator] _handle_add_request: stage=%s req=%s "
@@ -631,24 +645,32 @@ class Orchestrator:
                         except asyncio.CancelledError:
                             raise
                         except EngineDeadError as e:
+                            # Per-replica fault isolation (#4285): a dead stage
+                            # replica must not tear down the whole server. Evict
+                            # the dead replica and keep the orchestrator loop
+                            # alive so the API server stays up. Remaining live
+                            # replicas / stages keep serving.
                             logger.error(
-                                "[Orchestrator] Stage-%s is dead: %s",
+                                "[Orchestrator] Stage-%s replica-%s is dead; "
+                                "evicting it and failing its in-flight requests: %s",
                                 stage_id,
+                                replica_id,
                                 e,
                             )
-                            # TODO: Fault handling is intentionally fail-stop at
-                            # the orchestrator level today. If one replica in a
-                            # logical stage dies, we promote it to `_fatal_error`,
-                            # notify requests already admitted to that stage, and
-                            # re-raise so `run()` shuts down all stages. This is
-                            # conservative but means a single unhealthy replica in
-                            # a multi-replica deployment can take down otherwise
-                            # healthy replicas in other stages. Revisit this when
-                            # adding per-replica fault isolation / eviction.
-                            self._fatal_error = str(e)
-                            self._fatal_error_stage_id = stage_id
+                            pool.evict_replica(replica_id)
+                            # If the stage still has a live replica, fail only the
+                            # requests bound to the dead replica; requests bound to
+                            # a surviving replica (or not yet bound) keep running
+                            # and can be (re)dispatched. If the stage has no live
+                            # replica left, every request routed through it must
+                            # fail since none can be served.
+                            stage_has_live = bool(pool.live_replica_ids())
+                            failed_ids: list[str] = []
                             for req_id, req_state in list(self.request_states.items()):
-                                if stage_id in req_state.stage_submit_ts:
+                                if stage_id not in req_state.stage_submit_ts:
+                                    continue
+                                bound = pool.get_bound_replica_id(req_id)
+                                if bound == replica_id or not stage_has_live:
                                     await self.output_async_queue.put(
                                         ErrorMessage(
                                             error=str(e),
@@ -658,8 +680,9 @@ class Orchestrator:
                                         )
                                     )
                                     self.request_states.pop(req_id, None)
-                            self._shutdown_event.set()
-                            raise
+                                    failed_ids.append(req_id)
+                            pool.release_bindings(failed_ids)
+                            continue
                         except Exception:
                             if self._shutdown_event.is_set():
                                 return
@@ -1034,6 +1057,27 @@ class Orchestrator:
         """Forward output from the current logical stage to the next one."""
         next_logical = src_stage_id + 1
         next_pool = self.stage_pools[next_logical]
+        if not next_pool.live_replica_ids():
+            # The downstream stage lost all of its replicas before this in-flight
+            # request could be forwarded. Fail the request instead of letting the
+            # dispatch raise (which would propagate out of the orchestration loop
+            # and tear down the server). Per-replica fault isolation (#4285).
+            logger.error(
+                "[Orchestrator] req=%s: stage-%d has no live replica; failing the request",
+                req_id,
+                next_logical,
+            )
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    error=f"Stage-{next_logical} has no live replica",
+                    fatal=True,
+                    request_id=req_id,
+                    stage_id=next_logical,
+                )
+            )
+            self.request_states.pop(req_id, None)
+            next_pool.release_bindings([req_id])
+            return
         next_client = next_pool.stage_client
         params = req_state.sampling_params_list[next_logical]
         source_outputs = [output]
@@ -1358,53 +1402,6 @@ class Orchestrator:
         return sender_infos or None
 
     # ---- Shutdown / lifecycle ----
-
-    async def _drain_pending_requests_on_fatal(self) -> None:
-        """Drain the request queue and broadcast fatal errors for any
-        pending add_request messages that were never processed.
-
-        Called from the ``run()`` finally block when a fatal error
-        (e.g. ``EngineDeadError``) caused the orchestrator to shut down
-        before the request handler could process all queued messages.
-        Also broadcasts for any already-tracked requests still in
-        ``request_states`` that were not yet notified.
-        """
-        assert self._fatal_error is not None
-
-        notified: set[str] = set()
-
-        # 1) Drain pending messages from the request queue.
-        while True:
-            try:
-                msg = self.request_async_queue.get_nowait()
-            except Exception:
-                break
-            if msg.type == "add_request":
-                req_id = msg.request_id
-                await self.output_async_queue.put(
-                    ErrorMessage(
-                        error=self._fatal_error,
-                        fatal=True,
-                        request_id=req_id,
-                        stage_id=self._fatal_error_stage_id,
-                    )
-                )
-                notified.add(req_id)
-
-        # 2) Broadcast for any tracked requests not already notified
-        #    (e.g. request was registered but the EngineDeadError handler
-        #    missed it because it wasn't submitted to the dead stage yet).
-        for req_id in list(self.request_states):
-            if req_id not in notified:
-                await self.output_async_queue.put(
-                    ErrorMessage(
-                        error=self._fatal_error,
-                        fatal=True,
-                        request_id=req_id,
-                        stage_id=self._fatal_error_stage_id,
-                    )
-                )
-            self.request_states.pop(req_id, None)
 
     def _shutdown_stages(self) -> None:
         """Shutdown all stage pools."""
