@@ -679,9 +679,14 @@ class Orchestrator:
                                             stage_id=stage_id,
                                         )
                                     )
-                                    self.request_states.pop(req_id, None)
                                     failed_ids.append(req_id)
-                            pool.release_bindings(failed_ids)
+                            # Use the shared cleanup path so the running counter,
+                            # PD/CFG state, and bindings across every stage pool are
+                            # released (not just this pool).
+                            for req_id in failed_ids:
+                                await self._cleanup_request_ids(
+                                    [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                                )
                             continue
                         except Exception:
                             if self._shutdown_event.is_set():
@@ -1075,8 +1080,9 @@ class Orchestrator:
                     stage_id=next_logical,
                 )
             )
-            self.request_states.pop(req_id, None)
-            next_pool.release_bindings([req_id])
+            # Shared cleanup path: release the running counter, PD/CFG state, and
+            # bindings across every stage pool (not just the downstream one).
+            await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
             return
         next_client = next_pool.stage_client
         params = req_state.sampling_params_list[next_logical]
