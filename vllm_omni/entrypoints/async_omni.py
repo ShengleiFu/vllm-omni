@@ -1025,10 +1025,11 @@ class AsyncOmni(EngineClient, OmniBase):
 
     @property
     def errored(self) -> bool:
-        """Whether the engine is in a non-recoverable error state.
+        """Whether the engine is in a process-fatal error state.
 
-        Delegates to ``OmniBase.errored`` which checks the orchestrator
-        thread and all stage clients.  Redeclared here to satisfy the
+        Delegates to ``OmniBase.errored``, which is true only when the
+        orchestrator thread is dead; per-stage liveness is reported via
+        ``check_health`` instead.  Redeclared here to satisfy the
         ``EngineClient`` abstract-property requirement (Python's ABC
         mechanism does not resolve abstract methods from sibling MRO
         entries).

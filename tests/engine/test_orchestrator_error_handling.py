@@ -78,13 +78,6 @@ def orchestrator_factory():
 # ───────── EngineDeadError from LLM stage poll ─────────
 
 
-class FakeDeadLLMStageClient(FakeStageClient):
-    """LLM stage client that raises EngineDeadError on get_output_async."""
-
-    async def get_output_async(self):
-        raise EngineDeadError("Stage-0 engine core is dead")
-
-
 @pytest.mark.asyncio
 async def test_engine_dead_error_evicts_replica_and_keeps_running(orchestrator_factory) -> None:
     """When a stage replica raises EngineDeadError during poll, the orchestrator must:
@@ -92,7 +85,7 @@ async def test_engine_dead_error_evicts_replica_and_keeps_running(orchestrator_f
     2. Evict the dead replica and keep running so the API server stays up
        (per-replica fault isolation, #4285)
     """
-    stage0 = FakeDeadLLMStageClient(stage_type="llm", final_output=True)
+    stage0 = _DieOnDemandLLMStageClient(stage_type="llm", final_output=True)
     orchestrator_fixture = orchestrator_factory([stage0])
     request = SimpleNamespace(request_id="req-dead", prompt_token_ids=[1, 2])
 
@@ -105,6 +98,12 @@ async def test_engine_dead_error_evicts_replica_and_keeps_running(orchestrator_f
             sampling_params_list=[_sampling_params()],
             final_stage_id=0,
         )
+        # Let the request dispatch before the replica dies; a replica dead on
+        # its very first poll can be evicted before dispatch, which routes the
+        # failure through the add-request guard instead (that ordering is
+        # covered by test_add_request_to_dead_stage_fails_request_not_server).
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        stage0.die = True
 
         # Collect the fatal error message.
         msg = await _get_any_output_message(orchestrator_fixture)
@@ -113,7 +112,7 @@ async def test_engine_dead_error_evicts_replica_and_keeps_running(orchestrator_f
         assert msg.type == "error"
         assert msg.fatal is True
         assert msg.request_id == "req-dead"
-        assert "Stage-0 engine core is dead" in msg.error
+        assert "Stage-0 replica-0 is dead" in msg.error
 
         # The dead replica is evicted; the orchestrator keeps running.
         pool = orchestrator_fixture.orchestrator.stage_pools[0]

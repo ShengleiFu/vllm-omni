@@ -250,31 +250,23 @@ class OmniBase(PDDisaggregationMixin):
             self._consumed_metric_messages = consumed_by_request
         return consumed_by_request.setdefault(request_id, set())
 
-    def _has_dead_stage(self) -> bool:
-        """True when any stage has lost all its replicas.
-
-        A single dead replica with surviving replicas does not mark the whole
-        engine errored, so the API server stays up and only requests routed
-        through the dead replica fail (per-replica fault isolation, #4285).
-        """
-        pools = getattr(self.engine, "stage_pools", None)
-        if pools is None:
-            return False
-        return any(self._stage_has_no_live_replica(pool) for pool in pools)
-
     @property
     def is_running(self) -> bool:
-        return self.engine.is_alive() and not self._has_dead_stage()
+        return self.engine.is_alive()
 
     @property
     def errored(self) -> bool:
-        """Whether the engine is in a non-recoverable error state.
+        """Whether the engine is in a process-fatal error state.
 
-        True when the orchestrator thread is dead **or** any stage has lost
-        all of its replicas. A stage that still has at least one live replica
-        is not an error state (per-replica fault isolation, #4285).
+        True only when the orchestrator thread is dead. Per-stage liveness is
+        deliberately excluded: the OpenAI serving paths precheck ``errored``
+        before request routing, so including it would reject requests that do
+        not touch the dead stage (e.g. text-only chat when the talker stage is
+        down). A fully dead stage instead fails only the requests routed
+        through it (dispatch guards) and flips readiness to 503 via
+        :meth:`check_health` (per-replica fault isolation, #4285).
         """
-        return not self.engine.is_alive() or self._has_dead_stage()
+        return not self.engine.is_alive()
 
     def check_health(self) -> None:
         if not self.engine.is_alive():
