@@ -440,22 +440,9 @@ class Orchestrator:
 
         if not self.stage_pools[stage_id].live_replica_ids():
             # Stage 0 lost all replicas between the HTTP-layer errored check and
-            # dispatch. Fail the request instead of raising (which would kill the
-            # request handler task and tear down the server). #4285. Done before
-            # registering request state / running counter so nothing leaks.
-            logger.error(
-                "[Orchestrator] req=%s: stage-%d has no live replica; failing the request",
-                request_id,
-                stage_id,
-            )
-            await self.output_async_queue.put(
-                ErrorMessage(
-                    error=f"Stage-{stage_id} has no live replica",
-                    fatal=True,
-                    request_id=request_id,
-                    stage_id=stage_id,
-                )
-            )
+            # dispatch. Runs before request state / running counter registration,
+            # so the helper's cleanup is a no-op here.
+            await self._fail_request_dead_stage(request_id, stage_id)
             return
 
         logger.debug(
@@ -728,48 +715,7 @@ class Orchestrator:
                         except asyncio.CancelledError:
                             raise
                         except EngineDeadError as e:
-                            # Per-replica fault isolation (#4285): a dead stage
-                            # replica must not tear down the whole server. Evict
-                            # the dead replica and keep the orchestrator loop
-                            # alive so the API server stays up. Remaining live
-                            # replicas / stages keep serving.
-                            logger.error(
-                                "[Orchestrator] Stage-%s replica-%s is dead; "
-                                "evicting it and failing its in-flight requests: %s",
-                                stage_id,
-                                replica_id,
-                                e,
-                            )
-                            pool.evict_replica(replica_id)
-                            # If the stage still has a live replica, fail only the
-                            # requests bound to the dead replica; requests bound to
-                            # a surviving replica (or not yet bound) keep running
-                            # and can be (re)dispatched. If the stage has no live
-                            # replica left, every request routed through it must
-                            # fail since none can be served.
-                            stage_has_live = bool(pool.live_replica_ids())
-                            failed_ids: list[str] = []
-                            for req_id, req_state in list(self.request_states.items()):
-                                if stage_id not in req_state.stage_submit_ts:
-                                    continue
-                                bound = pool.get_bound_replica_id(req_id)
-                                if bound == replica_id or not stage_has_live:
-                                    await self.output_async_queue.put(
-                                        ErrorMessage(
-                                            error=str(e),
-                                            fatal=True,
-                                            request_id=req_id,
-                                            stage_id=stage_id,
-                                        )
-                                    )
-                                    failed_ids.append(req_id)
-                            # Use the shared cleanup path so the running counter,
-                            # PD/CFG state, and bindings across every stage pool are
-                            # released (not just this pool).
-                            for req_id in failed_ids:
-                                await self._cleanup_request_ids(
-                                    [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
-                                )
+                            await self._handle_dead_replica(stage_id, replica_id, e)
                             continue
                         except Exception:
                             if self._shutdown_event.is_set():
@@ -840,6 +786,71 @@ class Orchestrator:
             [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)],
             abort=True,
         )
+
+    async def _handle_dead_replica(self, stage_id: int, replica_id: int, error: EngineDeadError) -> None:
+        """Evict a dead stage replica and fail the requests stranded on it (#4285).
+
+        A dead replica must not tear down the whole server: evict it and keep the
+        orchestrator loop alive so remaining live replicas / stages keep serving.
+        If the stage still has a live replica, fail only the requests bound to the
+        dead replica; requests bound to a surviving replica (or not yet bound)
+        keep running and can be (re)dispatched. If the stage has no live replica
+        left, every request routed through it must fail since none can be served.
+        """
+        pool = self.stage_pools[stage_id]
+        logger.error(
+            "[Orchestrator] Stage-%s replica-%s is dead; evicting it and failing its in-flight requests: %s",
+            stage_id,
+            replica_id,
+            error,
+        )
+        pool.evict_replica(replica_id)
+        stage_has_live = bool(pool.live_replica_ids())
+        failed_ids: list[str] = []
+        for req_id, req_state in list(self.request_states.items()):
+            if stage_id not in req_state.stage_submit_ts:
+                continue
+            bound = pool.get_bound_replica_id(req_id)
+            if bound == replica_id or not stage_has_live:
+                await self.output_async_queue.put(
+                    ErrorMessage(
+                        error=str(error),
+                        fatal=True,
+                        request_id=req_id,
+                        stage_id=stage_id,
+                    )
+                )
+                failed_ids.append(req_id)
+        # Use the shared cleanup path so the running counter, PD/CFG state, and
+        # bindings across every stage pool are released (not just this pool).
+        for req_id in failed_ids:
+            await self._cleanup_request_ids(
+                [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+            )
+
+    async def _fail_request_dead_stage(self, req_id: str, stage_id: int) -> None:
+        """Fail one request whose target stage has no live replica (#4285).
+
+        Used at dispatch sites so a fully dead stage fails just that request
+        instead of raising out of the request/orchestration task and tearing
+        down the server. The cleanup releases the running counter, PD/CFG state,
+        and bindings across every stage pool; it is a no-op for a request that
+        was never registered.
+        """
+        logger.error(
+            "[Orchestrator] req=%s: stage-%d has no live replica; failing the request",
+            req_id,
+            stage_id,
+        )
+        await self.output_async_queue.put(
+            ErrorMessage(
+                error=f"Stage-{stage_id} has no live replica",
+                fatal=True,
+                request_id=req_id,
+                stage_id=stage_id,
+            )
+        )
+        await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
 
     # ---- Shared helpers ----
 
@@ -1219,25 +1230,8 @@ class Orchestrator:
         next_pool = self.stage_pools[next_logical]
         if not next_pool.live_replica_ids():
             # The downstream stage lost all of its replicas before this in-flight
-            # request could be forwarded. Fail the request instead of letting the
-            # dispatch raise (which would propagate out of the orchestration loop
-            # and tear down the server). Per-replica fault isolation (#4285).
-            logger.error(
-                "[Orchestrator] req=%s: stage-%d has no live replica; failing the request",
-                req_id,
-                next_logical,
-            )
-            await self.output_async_queue.put(
-                ErrorMessage(
-                    error=f"Stage-{next_logical} has no live replica",
-                    fatal=True,
-                    request_id=req_id,
-                    stage_id=next_logical,
-                )
-            )
-            # Shared cleanup path: release the running counter, PD/CFG state, and
-            # bindings across every stage pool (not just the downstream one).
-            await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+            # request could be forwarded.
+            await self._fail_request_dead_stage(req_id, next_logical)
             return
         next_client = next_pool.stage_client
         params = req_state.sampling_params_list[next_logical]
