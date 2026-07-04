@@ -14,10 +14,12 @@ import queue
 import time
 from types import SimpleNamespace
 
+import janus
 import pytest
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.engine.messages import EngineQueueMessage, ErrorMessage, ShutdownRequestMessage
+from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -302,6 +304,140 @@ async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_f
         if orchestrator_fixture.thread.is_alive():
             orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
             orchestrator_fixture.thread.join(timeout=5)
+
+
+# ───────── Direct unit tests for the fault-isolation helpers ─────────
+
+
+def _build_bare_orchestrator(stage_pools) -> tuple[Orchestrator, tuple[janus.Queue, ...]]:
+    """Construct an Orchestrator on the current event loop without running it.
+
+    Lets tests await the fault-isolation helpers directly instead of driving
+    them through the orchestration loop.
+    """
+    queues = (janus.Queue(), janus.Queue(), janus.Queue())
+    orchestrator = Orchestrator(
+        request_async_queue=queues[0].async_q,
+        output_async_queue=queues[1].async_q,
+        rpc_async_queue=queues[2].async_q,
+        stage_pools=stage_pools,
+    )
+    return orchestrator, queues
+
+
+def _register_request(orchestrator: Orchestrator, request_id: str, *, submitted_stage: int | None = 0) -> None:
+    state = OrchestratorRequestState(request_id=request_id)
+    if submitted_stage is not None:
+        state.stage_submit_ts[submitted_stage] = time.time()
+    orchestrator.request_states[request_id] = state
+
+
+@pytest.mark.asyncio
+async def test_handle_dead_replica_fails_only_bound_requests() -> None:
+    """Direct helper test: with a surviving replica, only requests bound to the
+    dead replica fail; the survivor's requests and bindings are untouched.
+    """
+    r0 = FakeStageClient(stage_type="llm", final_output=True)
+    r1 = FakeStageClient(stage_type="llm", final_output=True)
+    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[r0, r1]]))
+    try:
+        pool = orchestrator.stage_pools[0]
+        _register_request(orchestrator, "req-0")
+        _register_request(orchestrator, "req-1")
+        assert pool.select_replica_id("req-0") == 0
+        assert pool.select_replica_id("req-1") == 1
+
+        await orchestrator._handle_dead_replica(0, 0, EngineDeadError("replica-0 dead"))
+
+        assert pool.live_replica_ids() == [1]
+        assert r0.shutdown_calls == 1
+        msg = queues[1].async_q.get_nowait()
+        assert isinstance(msg, ErrorMessage)
+        assert msg.fatal is True
+        assert msg.request_id == "req-0"
+        assert msg.stage_id == 0
+        assert "replica-0 dead" in msg.error
+        assert queues[1].async_q.empty()
+        assert "req-0" not in orchestrator.request_states
+        assert "req-1" in orchestrator.request_states
+        assert pool.get_bound_replica_id("req-0") is None
+        assert pool.get_bound_replica_id("req-1") == 1
+    finally:
+        for q in queues:
+            q.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_dead_replica_last_replica_fails_all_stage_requests() -> None:
+    """Direct helper test: when the dead replica was the stage's last one, every
+    request routed through the stage fails — bound or not — while requests that
+    never entered the stage survive.
+    """
+    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[FakeStageClient(stage_type="llm")]]))
+    try:
+        pool = orchestrator.stage_pools[0]
+        _register_request(orchestrator, "req-bound")
+        _register_request(orchestrator, "req-unbound")
+        _register_request(orchestrator, "req-elsewhere", submitted_stage=None)
+        assert pool.select_replica_id("req-bound") == 0
+
+        await orchestrator._handle_dead_replica(0, 0, EngineDeadError("last replica dead"))
+
+        assert pool.live_replica_ids() == []
+        failed = {queues[1].async_q.get_nowait().request_id for _ in range(2)}
+        assert failed == {"req-bound", "req-unbound"}
+        assert queues[1].async_q.empty()
+        assert set(orchestrator.request_states) == {"req-elsewhere"}
+    finally:
+        for q in queues:
+            q.close()
+
+
+@pytest.mark.asyncio
+async def test_fail_request_dead_stage_cleans_registered_request() -> None:
+    """Direct helper test: a registered request failed against a dead stage gets
+    a fatal ErrorMessage and its state and bindings are released.
+    """
+    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[FakeStageClient(stage_type="llm")]]))
+    try:
+        pool = orchestrator.stage_pools[0]
+        _register_request(orchestrator, "req-a")
+        assert pool.select_replica_id("req-a") == 0
+
+        await orchestrator._fail_request_dead_stage("req-a", 0)
+
+        msg = queues[1].async_q.get_nowait()
+        assert isinstance(msg, ErrorMessage)
+        assert msg.error == "Stage-0 has no live replica"
+        assert msg.fatal is True
+        assert msg.request_id == "req-a"
+        assert msg.stage_id == 0
+        assert "req-a" not in orchestrator.request_states
+        assert pool.get_bound_replica_id("req-a") is None
+    finally:
+        for q in queues:
+            q.close()
+
+
+@pytest.mark.asyncio
+async def test_fail_request_dead_stage_is_noop_safe_for_unregistered_request() -> None:
+    """Direct helper test: the stage-0 dispatch guard calls the helper before the
+    request is registered; the cleanup must be a safe no-op and still emit the
+    fatal ErrorMessage.
+    """
+    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[FakeStageClient(stage_type="llm")]]))
+    try:
+        await orchestrator._fail_request_dead_stage("req-unknown", 0)
+
+        msg = queues[1].async_q.get_nowait()
+        assert isinstance(msg, ErrorMessage)
+        assert msg.error == "Stage-0 has no live replica"
+        assert msg.fatal is True
+        assert msg.request_id == "req-unknown"
+        assert orchestrator.request_states == {}
+    finally:
+        for q in queues:
+            q.close()
 
 
 # ───────── Diffusion stage error output routing ─────────
