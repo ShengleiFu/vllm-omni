@@ -36,6 +36,19 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class StageUnavailableError(RuntimeError):
+    """Raised when dispatch cannot reach a live replica of a stage.
+
+    Deliberately a ``RuntimeError`` subclass (not ``EngineDeadError``): no
+    engine died at the raise site — the stage's replica set is empty or the
+    chosen slot was evicted, which is a routing/capacity condition and, in
+    distributed mode, recoverable. Dispatch guards catch exactly this type so
+    unrelated ``RuntimeError``s keep failing fast, and existing
+    ``EngineDeadError`` handlers (teardown-on-dead, poll-path eviction) are
+    not silently enrolled.
+    """
+
+
 @dataclass
 class _ReplicaMetrics:
     """Per-replica metrics accumulators owned by a stage pool."""
@@ -306,7 +319,9 @@ class StagePool:
 
             now = _time.monotonic()
             if now >= deadline:
-                raise RuntimeError(f"no UP replica for stage {self.stage_id} after {self.DISPATCH_WAIT_TIMEOUT_S:.1f}s")
+                raise StageUnavailableError(
+                    f"no UP replica for stage {self.stage_id} after {self.DISPATCH_WAIT_TIMEOUT_S:.1f}s"
+                )
             await asyncio.sleep(min(self.DISPATCH_RETRY_INTERVAL_S, deadline - now))
 
     def preselect_replica_id(
@@ -495,7 +510,7 @@ class StagePool:
         if chosen is None:
             live = self.live_replica_ids()
             if not live:
-                raise RuntimeError(f"stage {self.stage_id} has no live replicas")
+                raise StageUnavailableError(f"stage {self.stage_id} has no live replicas")
             if len(live) == 1:
                 chosen = live[0]
             else:
@@ -510,13 +525,13 @@ class StagePool:
     def _llm_client(self, replica_id: int) -> StagePoolLLMClient:
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         return cast(StagePoolLLMClient, client)
 
     def _diffusion_client(self, replica_id: int) -> StagePoolDiffusionClient:
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         return cast(StagePoolDiffusionClient, client)
 
     # ---- Metrics ----
@@ -967,7 +982,7 @@ class StagePool:
         )
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         try:
             self.output_processor.add_request(
                 request=request,
@@ -1016,7 +1031,7 @@ class StagePool:
 
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
 
         if self.stage_type == "diffusion":
             if isinstance(request, list):

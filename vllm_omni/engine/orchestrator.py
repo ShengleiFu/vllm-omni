@@ -46,7 +46,7 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
@@ -527,12 +527,18 @@ class Orchestrator:
                 request,
                 prompt_text=msg.output_prompt_text,
             )
-        except (RuntimeError, EngineDeadError):
+        except (StageUnavailableError, EngineDeadError) as e:
             # Dispatch raced replica eviction: the request state can still be
             # present while _handle_dead_replica is mid-flight, so submitting
             # can hit a stage with no live replica. Fail this request instead
             # of letting the raise escape _request_handler and shut the whole
-            # server down (#4285).
+            # server down (#4285). Unrelated errors propagate.
+            logger.error(
+                "[Orchestrator] streaming_update dispatch for req=%s raced stage-%s replica eviction: %s",
+                request_id,
+                stage_id,
+                e,
+            )
             await self._fail_request_dead_stage(request_id, stage_id)
             return
 
@@ -577,10 +583,17 @@ class Orchestrator:
                 prompt_text=msg.companion_prompt_text,
                 affinity_request_id=parent_id,
             )
-        except (RuntimeError, EngineDeadError):
+        except (StageUnavailableError, EngineDeadError) as e:
             # Dispatch raced replica eviction (#4285): fail the parent request
             # (its cleanup also releases this companion) instead of letting
             # the raise escape _request_handler and shut the server down.
+            # Unrelated errors propagate.
+            logger.error(
+                "[Orchestrator] companion %s dispatch for parent=%s raced stage-0 replica eviction: %s",
+                companion_id,
+                parent_id,
+                e,
+            )
             await self._fail_request_dead_stage(parent_id, 0)
             return
 

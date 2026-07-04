@@ -470,6 +470,43 @@ async def test_streaming_update_racing_eviction_fails_request_not_server() -> No
 
 
 @pytest.mark.asyncio
+async def test_streaming_update_unrelated_error_is_not_masked() -> None:
+    """The dispatch guard converts only StageUnavailableError/EngineDeadError;
+    a genuine bug surfacing as a plain RuntimeError must propagate (fail
+    fast), not be misreported as a dead-stage request failure.
+    """
+
+    class _BuggyClient(FakeStageClient):
+        async def add_request_async(self, *args, **kwargs):
+            raise RuntimeError("boom: unrelated bug")
+
+    orchestrator, queues = _build_bare_orchestrator(
+        _build_stage_pools([[_BuggyClient(stage_type="llm", final_output=True)]])
+    )
+    try:
+        _register_request(orchestrator, "req-b")
+        orchestrator.request_states["req-b"].sampling_params_list = [_sampling_params()]
+
+        msg = StageSubmissionMessage(
+            type="streaming_update",
+            request_id="req-b",
+            prompt=SimpleNamespace(request_id="req-b", prompt_token_ids=[1]),
+            original_prompt={"prompt": "hi"},
+            output_prompt_text=None,
+            sampling_params_list=[],
+            final_stage_id=0,
+            preprocess_ms=0.0,
+            request_timestamp=time.time(),
+            enqueue_ts=time.time(),
+        )
+        with pytest.raises(RuntimeError, match="unrelated bug"):
+            await orchestrator._handle_streaming_update(msg)
+    finally:
+        for q in queues:
+            q.close()
+
+
+@pytest.mark.asyncio
 async def test_add_companion_racing_eviction_fails_parent_not_server() -> None:
     """A CFG companion submission hitting a fully dead stage must fail the
     parent request (whose cleanup also releases the companion), not raise out
