@@ -4,7 +4,7 @@ import os
 import time
 import weakref
 from collections.abc import Sequence
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import huggingface_hub
 from vllm.logger import init_logger
@@ -28,6 +28,9 @@ from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.tracking_parser import TrackingNamespace
+
+if TYPE_CHECKING:
+    from vllm_omni.engine.stage_pool import StagePool, StagePoolClient
 
 logger = init_logger(__name__)
 
@@ -222,7 +225,7 @@ class OmniBase(PDDisaggregationMixin):
         return self.engine.stage_configs
 
     @staticmethod
-    def _replica_is_dead(client: Any) -> bool:
+    def _replica_is_dead(client: StagePoolClient | None) -> bool:
         if client is None:
             return True
         if getattr(client, "_engine_dead", False):
@@ -230,7 +233,7 @@ class OmniBase(PDDisaggregationMixin):
         resources = getattr(client, "resources", None)
         return resources is not None and getattr(resources, "engine_dead", False)
 
-    def _live_replica_count(self, pool: Any) -> int:
+    def _live_replica_count(self, pool: StagePool) -> int:
         """Number of replicas in ``pool`` that are neither evicted nor dead.
 
         A dead replica is evicted from its pool (slot set to ``None`` in
@@ -239,7 +242,7 @@ class OmniBase(PDDisaggregationMixin):
         """
         return sum(1 for client in pool.clients if not self._replica_is_dead(client))
 
-    def _stage_has_no_live_replica(self, pool: Any) -> bool:
+    def _stage_has_no_live_replica(self, pool: StagePool) -> bool:
         """True when a non-empty stage pool has lost all of its replicas."""
         return len(pool.clients) > 0 and self._live_replica_count(pool) == 0
 

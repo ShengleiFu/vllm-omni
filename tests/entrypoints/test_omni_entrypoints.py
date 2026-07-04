@@ -106,9 +106,7 @@ class FakeAsyncOmniEngine:
         self.stage_clients = [SimpleNamespace(is_comprehension=False) for _ in range(self.num_stages)]
         # One replica per stage, sharing the stage_clients objects so a test that
         # marks stage_clients[i] dead is reflected in the pool's liveness.
-        self.stage_pools = [
-            SimpleNamespace(clients=[client], stage_id=i) for i, client in enumerate(self.stage_clients)
-        ]
+        self.stage_pools = [_FakeStagePool([client], stage_id=i) for i, client in enumerate(self.stage_clients)]
         self.stage_vllm_configs = [None for _ in range(self.num_stages)]
         self.output_processors = [SimpleNamespace(tokenizer=None) for _ in range(self.num_stages)]
         self.input_processor = None
@@ -1102,7 +1100,7 @@ async def test_async_omni_propagates_engine_generate_error(monkeypatch: pytest.M
 def test_check_health_passes_when_all_healthy():
     base = _make_base()
     base.engine.is_alive.return_value = True
-    base.engine.stage_pools = [SimpleNamespace(clients=[SimpleNamespace()], stage_id=0)]
+    base.engine.stage_pools = [_FakeStagePool([SimpleNamespace()])]
     base.check_health()  # should not raise
 
 
@@ -1110,7 +1108,7 @@ def test_check_health_raises_when_stage_dead():
     base = _make_base()
     base.engine.is_alive.return_value = True
     dead_stage = SimpleNamespace(_engine_dead=True)
-    base.engine.stage_pools = [SimpleNamespace(clients=[dead_stage], stage_id=1)]
+    base.engine.stage_pools = [_FakeStagePool([dead_stage], stage_id=1)]
     with pytest.raises(EngineDeadError, match="Stage-1"):
         base.check_health()
 
@@ -1129,7 +1127,7 @@ def test_check_health_raises_when_orchestrator_dead():
 def test_omni_base_errored_false_when_alive():
     base = _make_base()
     base.engine.is_alive.return_value = True
-    base.engine.stage_pools = [SimpleNamespace(clients=[SimpleNamespace()], stage_id=0)]
+    base.engine.stage_pools = [_FakeStagePool([SimpleNamespace()])]
     assert base.errored is False
 
 
@@ -1139,16 +1137,14 @@ def test_omni_base_is_running_true_when_stage_engine_dead():
     # kill the server on a partial failure.
     base = _make_base()
     base.engine.is_alive.return_value = True
-    base.engine.stage_pools = [SimpleNamespace(clients=[SimpleNamespace(_engine_dead=True)], stage_id=0)]
+    base.engine.stage_pools = [_FakeStagePool([SimpleNamespace(_engine_dead=True)])]
     assert base.is_running is True
 
 
 def test_omni_base_is_running_true_when_stage_resources_engine_dead():
     base = _make_base()
     base.engine.is_alive.return_value = True
-    base.engine.stage_pools = [
-        SimpleNamespace(clients=[SimpleNamespace(resources=SimpleNamespace(engine_dead=True))], stage_id=0)
-    ]
+    base.engine.stage_pools = [_FakeStagePool([SimpleNamespace(resources=SimpleNamespace(engine_dead=True))])]
     assert base.is_running is True
 
 
@@ -1165,7 +1161,7 @@ def test_omni_base_errored_false_when_stage_engine_dead():
     base = _make_base()
     base.engine.is_alive.return_value = True
     dead_stage = SimpleNamespace(_engine_dead=True)
-    base.engine.stage_pools = [SimpleNamespace(clients=[dead_stage], stage_id=0)]
+    base.engine.stage_pools = [_FakeStagePool([dead_stage])]
     assert base.errored is False
 
 
@@ -1173,7 +1169,7 @@ def test_omni_base_errored_false_when_stage_resources_engine_dead():
     base = _make_base()
     base.engine.is_alive.return_value = True
     dead_stage = SimpleNamespace(resources=SimpleNamespace(engine_dead=True))
-    base.engine.stage_pools = [SimpleNamespace(clients=[dead_stage], stage_id=0)]
+    base.engine.stage_pools = [_FakeStagePool([dead_stage])]
     assert base.errored is False
 
 

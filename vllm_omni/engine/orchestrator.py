@@ -520,12 +520,21 @@ class Orchestrator:
 
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
-        await self.stage_pools[stage_id].submit_update(
-            request_id,
-            req_state,
-            request,
-            prompt_text=msg.output_prompt_text,
-        )
+        try:
+            await self.stage_pools[stage_id].submit_update(
+                request_id,
+                req_state,
+                request,
+                prompt_text=msg.output_prompt_text,
+            )
+        except (RuntimeError, EngineDeadError):
+            # Dispatch raced replica eviction: the request state can still be
+            # present while _handle_dead_replica is mid-flight, so submitting
+            # can hit a stage with no live replica. Fail this request instead
+            # of letting the raise escape _request_handler and shut the whole
+            # server down (#4285).
+            await self._fail_request_dead_stage(request_id, stage_id)
+            return
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
@@ -560,13 +569,20 @@ class Orchestrator:
         )
         self.request_states[companion_id] = companion_state
         companion_state.stage_submit_ts[0] = _time.time()
-        companion_replica_id = await self.stage_pools[0].submit_initial(
-            companion_id,
-            companion_state,
-            companion_prompt,
-            prompt_text=msg.companion_prompt_text,
-            affinity_request_id=parent_id,
-        )
+        try:
+            companion_replica_id = await self.stage_pools[0].submit_initial(
+                companion_id,
+                companion_state,
+                companion_prompt,
+                prompt_text=msg.companion_prompt_text,
+                affinity_request_id=parent_id,
+            )
+        except (RuntimeError, EngineDeadError):
+            # Dispatch raced replica eviction (#4285): fail the parent request
+            # (its cleanup also releases this companion) instead of letting
+            # the raise escape _request_handler and shut the server down.
+            await self._fail_request_dead_stage(parent_id, 0)
+            return
 
         logger.info(
             "[Orchestrator] CFG companion submitted: %s (role=%s, parent=%s, stage-0 replica-%s)",
@@ -823,9 +839,13 @@ class Orchestrator:
                 failed_ids.append(req_id)
         # Use the shared cleanup path so the running counter, PD/CFG state, and
         # bindings across every stage pool are released (not just this pool).
+        # abort=True stops the failed requests' in-flight work on surviving
+        # stages (abort skips dead/evicted bindings), matching the
+        # distributed-membership eviction path.
         for req_id in failed_ids:
             await self._cleanup_request_ids(
                 [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                abort=True,
             )
 
     async def _fail_request_dead_stage(self, req_id: str, stage_id: int) -> None:
@@ -850,7 +870,10 @@ class Orchestrator:
                 stage_id=stage_id,
             )
         )
-        await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+        await self._cleanup_request_ids(
+            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+            abort=True,
+        )
 
     # ---- Shared helpers ----
 

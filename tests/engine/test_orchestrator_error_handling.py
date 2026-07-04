@@ -18,7 +18,13 @@ import janus
 import pytest
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.engine.messages import EngineQueueMessage, ErrorMessage, ShutdownRequestMessage
+from vllm_omni.engine.messages import (
+    AddCompanionRequestMessage,
+    EngineQueueMessage,
+    ErrorMessage,
+    ShutdownRequestMessage,
+    StageSubmissionMessage,
+)
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -395,9 +401,11 @@ async def test_handle_dead_replica_last_replica_fails_all_stage_requests() -> No
 @pytest.mark.asyncio
 async def test_fail_request_dead_stage_cleans_registered_request() -> None:
     """Direct helper test: a registered request failed against a dead stage gets
-    a fatal ErrorMessage and its state and bindings are released.
+    a fatal ErrorMessage, its state and bindings are released, and its
+    in-flight work on live replicas is aborted.
     """
-    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[FakeStageClient(stage_type="llm")]]))
+    r0 = FakeStageClient(stage_type="llm")
+    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[r0]]))
     try:
         pool = orchestrator.stage_pools[0]
         _register_request(orchestrator, "req-a")
@@ -413,6 +421,83 @@ async def test_fail_request_dead_stage_cleans_registered_request() -> None:
         assert msg.stage_id == 0
         assert "req-a" not in orchestrator.request_states
         assert pool.get_bound_replica_id("req-a") is None
+        # abort=True: the failed request's work on the still-live replica is
+        # stopped, not left to run to completion.
+        assert r0.abort_calls == [["req-a"]]
+    finally:
+        for q in queues:
+            q.close()
+
+
+@pytest.mark.asyncio
+async def test_streaming_update_racing_eviction_fails_request_not_server() -> None:
+    """A streaming_update can find its request state still present while the
+    stage has already lost all replicas (_handle_dead_replica awaits between
+    eviction and cleanup). Submitting then raises from replica selection; the
+    handler must fail that request instead of letting the raise escape
+    _request_handler and shut the server down (#4285).
+    """
+    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[FakeStageClient(stage_type="llm")]]))
+    try:
+        pool = orchestrator.stage_pools[0]
+        _register_request(orchestrator, "req-s")
+        orchestrator.request_states["req-s"].sampling_params_list = [_sampling_params()]
+        assert pool.select_replica_id("req-s") == 0
+        pool.evict_replica(0)
+
+        msg = StageSubmissionMessage(
+            type="streaming_update",
+            request_id="req-s",
+            prompt=SimpleNamespace(request_id="req-s", prompt_token_ids=[1]),
+            original_prompt={"prompt": "hi"},
+            output_prompt_text=None,
+            sampling_params_list=[],
+            final_stage_id=0,
+            preprocess_ms=0.0,
+            request_timestamp=time.time(),
+            enqueue_ts=time.time(),
+        )
+        await orchestrator._handle_streaming_update(msg)
+
+        err = queues[1].async_q.get_nowait()
+        assert isinstance(err, ErrorMessage)
+        assert err.fatal is True
+        assert err.request_id == "req-s"
+        assert "req-s" not in orchestrator.request_states
+    finally:
+        for q in queues:
+            q.close()
+
+
+@pytest.mark.asyncio
+async def test_add_companion_racing_eviction_fails_parent_not_server() -> None:
+    """A CFG companion submission hitting a fully dead stage must fail the
+    parent request (whose cleanup also releases the companion), not raise out
+    of _request_handler (#4285).
+    """
+    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[FakeStageClient(stage_type="llm")]]))
+    try:
+        pool = orchestrator.stage_pools[0]
+        _register_request(orchestrator, "req-p")
+        orchestrator.request_states["req-p"].sampling_params_list = [_sampling_params()]
+        pool.evict_replica(0)
+
+        msg = AddCompanionRequestMessage(
+            companion_id="req-p-cfg",
+            parent_id="req-p",
+            role="negative",
+            prompt=SimpleNamespace(request_id="req-p-cfg", prompt_token_ids=[2]),
+            companion_prompt_text=None,
+            sampling_params_list=[_sampling_params()],
+        )
+        await orchestrator._handle_add_companion(msg)
+
+        err = queues[1].async_q.get_nowait()
+        assert isinstance(err, ErrorMessage)
+        assert err.fatal is True
+        assert err.request_id == "req-p"
+        assert "req-p" not in orchestrator.request_states
+        assert "req-p-cfg" not in orchestrator.request_states
     finally:
         for q in queues:
             q.close()
