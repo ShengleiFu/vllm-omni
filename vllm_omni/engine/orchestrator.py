@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -477,15 +478,26 @@ class Orchestrator:
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
-        await self.stage_pools[stage_id].submit_initial(
-            request_id,
-            req_state,
-            prompt,
-            prompt_text=msg.output_prompt_text,
-        )
+        if not await self._dispatch_or_fail_request(
+            self.stage_pools[stage_id].submit_initial(
+                request_id,
+                req_state,
+                prompt,
+                prompt_text=msg.output_prompt_text,
+            ),
+            req_id=request_id,
+            stage_id=stage_id,
+            what="add_request",
+        ):
+            return
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
+            await self._dispatch_or_fail_request(
+                self._prewarm_async_chunk_stages(request_id, prompt, req_state),
+                req_id=request_id,
+                stage_id=stage_id,
+                what="async-chunk prewarm",
+            )
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
         """Handle a streaming_update message for an existing request."""
@@ -520,30 +532,26 @@ class Orchestrator:
 
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
-        try:
-            await self.stage_pools[stage_id].submit_update(
+        if not await self._dispatch_or_fail_request(
+            self.stage_pools[stage_id].submit_update(
                 request_id,
                 req_state,
                 request,
                 prompt_text=msg.output_prompt_text,
-            )
-        except (StageUnavailableError, EngineDeadError) as e:
-            # Dispatch raced replica eviction: the request state can still be
-            # present while _handle_dead_replica is mid-flight, so submitting
-            # can hit a stage with no live replica. Fail this request instead
-            # of letting the raise escape _request_handler and shut the whole
-            # server down (#4285). Unrelated errors propagate.
-            logger.error(
-                "[Orchestrator] streaming_update dispatch for req=%s raced stage-%s replica eviction: %s",
-                request_id,
-                stage_id,
-                e,
-            )
-            await self._fail_request_dead_stage(request_id, stage_id)
+            ),
+            req_id=request_id,
+            stage_id=stage_id,
+            what="streaming_update",
+        ):
             return
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._prewarm_async_chunk_stages(request_id, request, req_state)
+            await self._dispatch_or_fail_request(
+                self._prewarm_async_chunk_stages(request_id, request, req_state),
+                req_id=request_id,
+                stage_id=stage_id,
+                what="async-chunk prewarm",
+            )
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -575,26 +583,20 @@ class Orchestrator:
         )
         self.request_states[companion_id] = companion_state
         companion_state.stage_submit_ts[0] = _time.time()
-        try:
-            companion_replica_id = await self.stage_pools[0].submit_initial(
+        # A dead-stage failure is attributed to the parent request; its cleanup
+        # also releases this companion.
+        if not await self._dispatch_or_fail_request(
+            self.stage_pools[0].submit_initial(
                 companion_id,
                 companion_state,
                 companion_prompt,
                 prompt_text=msg.companion_prompt_text,
                 affinity_request_id=parent_id,
-            )
-        except (StageUnavailableError, EngineDeadError) as e:
-            # Dispatch raced replica eviction (#4285): fail the parent request
-            # (its cleanup also releases this companion) instead of letting
-            # the raise escape _request_handler and shut the server down.
-            # Unrelated errors propagate.
-            logger.error(
-                "[Orchestrator] companion %s dispatch for parent=%s raced stage-0 replica eviction: %s",
-                companion_id,
-                parent_id,
-                e,
-            )
-            await self._fail_request_dead_stage(parent_id, 0)
+            ),
+            req_id=parent_id,
+            stage_id=0,
+            what=f"companion {companion_id}",
+        ):
             return
 
         logger.info(
@@ -602,7 +604,7 @@ class Orchestrator:
             companion_id,
             role,
             parent_id,
-            companion_replica_id,
+            self.stage_pools[0].get_bound_replica_id(companion_id),
         )
 
     async def _handle_abort(self, msg: AbortRequestMessage) -> None:
@@ -887,6 +889,38 @@ class Orchestrator:
             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
             abort=True,
         )
+
+    async def _dispatch_or_fail_request(
+        self,
+        dispatch: Coroutine[Any, Any, Any],
+        *,
+        req_id: str,
+        stage_id: int,
+        what: str,
+    ) -> bool:
+        """Await a dispatch coroutine, converting stage unavailability into a
+        single-request failure.
+
+        Replica eviction can interleave with any dispatch await, surfacing as
+        StageUnavailableError (no live replica / evicted slot) or
+        EngineDeadError (replica died mid-submit before the poll loop evicted
+        it). Both mean "this request cannot be placed", not "the server is
+        broken": fail the request and keep serving (#4285). Unrelated errors
+        propagate. Returns False when the request was failed.
+        """
+        try:
+            await dispatch
+            return True
+        except (StageUnavailableError, EngineDeadError) as e:
+            logger.error(
+                "[Orchestrator] %s dispatch for req=%s raced stage-%s replica eviction: %s",
+                what,
+                req_id,
+                stage_id,
+                e,
+            )
+            await self._fail_request_dead_stage(req_id, stage_id)
+            return False
 
     # ---- Shared helpers ----
 
@@ -1251,6 +1285,33 @@ class Orchestrator:
             )
 
     async def _forward_to_next_stage(
+        self,
+        req_id: str,
+        src_stage_id: int,
+        output: Any,
+        req_state: OrchestratorRequestState,
+        *,
+        src_replica_id: int | None = None,
+        is_streaming_session: bool = False,
+        is_final_update: bool = False,
+    ) -> None:
+        """Forward output to the next stage; a dead stage fails only this request."""
+        await self._dispatch_or_fail_request(
+            self._forward_to_next_stage_unguarded(
+                req_id,
+                src_stage_id,
+                output,
+                req_state,
+                src_replica_id=src_replica_id,
+                is_streaming_session=is_streaming_session,
+                is_final_update=is_final_update,
+            ),
+            req_id=req_id,
+            stage_id=src_stage_id + 1,
+            what="inter-stage forward",
+        )
+
+    async def _forward_to_next_stage_unguarded(
         self,
         req_id: str,
         src_stage_id: int,
