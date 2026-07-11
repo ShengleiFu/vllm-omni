@@ -62,6 +62,22 @@ async def _get_any_output_message(fixture: OrchestratorFixture, *, timeout: floa
             await asyncio.sleep(0.01)
 
 
+async def _wait_for_error_message(
+    fixture: OrchestratorFixture,
+    *,
+    request_id: str | None = None,
+    max_messages: int = 50,
+) -> ErrorMessage:
+    """Drain output messages until the ErrorMessage arrives, skipping the
+    non-error outputs (e.g. stage metrics, forwarded stage results) that a
+    driven pipeline can interleave ahead of the failure."""
+    for _ in range(max_messages):
+        msg = await _get_any_output_message(fixture)
+        if isinstance(msg, ErrorMessage) and (request_id is None or msg.request_id == request_id):
+            return msg
+    raise AssertionError(f"No ErrorMessage for req={request_id} within {max_messages} messages")
+
+
 @pytest.fixture
 def orchestrator_factory():
     fixtures: list[OrchestratorFixture] = []
@@ -238,16 +254,10 @@ async def test_forward_to_dead_downstream_stage_fails_request_not_server(orchest
         # Completing stage 0 triggers a forward to the now-empty stage 1.
         stage0.push_engine_core_outputs(_engine_core_outputs("s0-raw", 1.0))
 
-        # Skip non-error messages (e.g. stage metrics) until the fatal error.
-        error_msg: ErrorMessage | None = None
-        for _ in range(50):
-            m = await _get_any_output_message(orchestrator_fixture)
-            if isinstance(m, ErrorMessage):
-                error_msg = m
-                break
-        assert error_msg is not None
+        # Completing stage 0 also emits its normal outputs; skip past them to
+        # the downstream-forward failure.
+        error_msg = await _wait_for_error_message(orchestrator_fixture, request_id="req-x")
         assert error_msg.fatal is True
-        assert error_msg.request_id == "req-x"
         assert error_msg.stage_id == 1
 
         assert orchestrator_fixture.thread.is_alive()
@@ -292,15 +302,9 @@ async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_f
             final_stage_id=0,
         )
 
-        seen_after = False
-        for _ in range(50):
-            m = await _get_any_output_message(orchestrator_fixture)
-            if isinstance(m, ErrorMessage) and m.request_id == "req-after":
-                assert m.fatal is True
-                assert m.stage_id == 0
-                seen_after = True
-                break
-        assert seen_after
+        error_msg = await _wait_for_error_message(orchestrator_fixture, request_id="req-after")
+        assert error_msg.fatal is True
+        assert error_msg.stage_id == 0
 
         assert orchestrator_fixture.thread.is_alive()
         # Guard runs before registration, so the failed request never enters state.

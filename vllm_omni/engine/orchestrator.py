@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
-from collections.abc import Coroutine
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -479,7 +479,7 @@ class Orchestrator:
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
         if not await self._dispatch_or_fail_request(
-            self.stage_pools[stage_id].submit_initial(
+            lambda: self.stage_pools[stage_id].submit_initial(
                 request_id,
                 req_state,
                 prompt,
@@ -487,16 +487,16 @@ class Orchestrator:
             ),
             req_id=request_id,
             stage_id=stage_id,
-            what="add_request",
+            operation="add_request",
         ):
             return
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
             await self._dispatch_or_fail_request(
-                self._prewarm_async_chunk_stages(request_id, prompt, req_state),
+                lambda: self._prewarm_async_chunk_stages(request_id, prompt, req_state),
                 req_id=request_id,
                 stage_id=stage_id,
-                what="async-chunk prewarm",
+                operation="async-chunk prewarm",
             )
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
@@ -533,7 +533,7 @@ class Orchestrator:
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
         if not await self._dispatch_or_fail_request(
-            self.stage_pools[stage_id].submit_update(
+            lambda: self.stage_pools[stage_id].submit_update(
                 request_id,
                 req_state,
                 request,
@@ -541,16 +541,16 @@ class Orchestrator:
             ),
             req_id=request_id,
             stage_id=stage_id,
-            what="streaming_update",
+            operation="streaming_update",
         ):
             return
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
             await self._dispatch_or_fail_request(
-                self._prewarm_async_chunk_stages(request_id, request, req_state),
+                lambda: self._prewarm_async_chunk_stages(request_id, request, req_state),
                 req_id=request_id,
                 stage_id=stage_id,
-                what="async-chunk prewarm",
+                operation="async-chunk prewarm",
             )
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
@@ -586,7 +586,7 @@ class Orchestrator:
         # A dead-stage failure is attributed to the parent request; its cleanup
         # also releases this companion.
         if not await self._dispatch_or_fail_request(
-            self.stage_pools[0].submit_initial(
+            lambda: self.stage_pools[0].submit_initial(
                 companion_id,
                 companion_state,
                 companion_prompt,
@@ -595,7 +595,7 @@ class Orchestrator:
             ),
             req_id=parent_id,
             stage_id=0,
-            what=f"companion {companion_id}",
+            operation=f"companion {companion_id}",
         ):
             return
 
@@ -892,16 +892,21 @@ class Orchestrator:
 
     async def _dispatch_or_fail_request(
         self,
-        dispatch: Coroutine[Any, Any, Any],
+        dispatch: Callable[[], Awaitable[Any]],
         *,
         req_id: str,
         stage_id: int,
-        what: str,
+        operation: str,
     ) -> bool:
-        """Await a dispatch coroutine, converting stage unavailability into a
+        """Run a dispatch action, converting stage unavailability into a
         single-request failure.
 
-        Replica eviction can interleave with any dispatch await, surfacing as
+        ``dispatch`` is a thunk rather than a bare coroutine so that replica
+        selection and other argument setup run inside this guard: a synchronous
+        StageUnavailableError raised while building the dispatch is caught here,
+        not left to propagate out of the caller.
+
+        Replica eviction can interleave with any dispatch, surfacing as
         StageUnavailableError (no live replica / evicted slot) or
         EngineDeadError (replica died mid-submit before the poll loop evicted
         it). Both mean "this request cannot be placed", not "the server is
@@ -909,12 +914,12 @@ class Orchestrator:
         propagate. Returns False when the request was failed.
         """
         try:
-            await dispatch
+            await dispatch()
             return True
         except (StageUnavailableError, EngineDeadError) as e:
             logger.error(
                 "[Orchestrator] %s dispatch for req=%s raced stage-%s replica eviction: %s",
-                what,
+                operation,
                 req_id,
                 stage_id,
                 e,
@@ -1297,7 +1302,7 @@ class Orchestrator:
     ) -> None:
         """Forward output to the next stage; a dead stage fails only this request."""
         await self._dispatch_or_fail_request(
-            self._forward_to_next_stage_unguarded(
+            lambda: self._forward_to_next_stage_unguarded(
                 req_id,
                 src_stage_id,
                 output,
@@ -1308,7 +1313,7 @@ class Orchestrator:
             ),
             req_id=req_id,
             stage_id=src_stage_id + 1,
-            what="inter-stage forward",
+            operation="inter-stage forward",
         )
 
     async def _forward_to_next_stage_unguarded(
