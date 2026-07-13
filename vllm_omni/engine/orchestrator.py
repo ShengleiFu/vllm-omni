@@ -492,12 +492,7 @@ class Orchestrator:
             return
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._dispatch_or_fail_request(
-                lambda: self._prewarm_async_chunk_stages(request_id, prompt, req_state),
-                req_id=request_id,
-                stage_id=stage_id,
-                operation="async-chunk prewarm",
-            )
+            await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
         """Handle a streaming_update message for an existing request."""
@@ -546,12 +541,7 @@ class Orchestrator:
             return
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._dispatch_or_fail_request(
-                lambda: self._prewarm_async_chunk_stages(request_id, request, req_state),
-                req_id=request_id,
-                stage_id=stage_id,
-                operation="async-chunk prewarm",
-            )
+            await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -698,16 +688,17 @@ class Orchestrator:
                     if self._shutdown_event.is_set():
                         return
 
-                    if pool.stage_type == "diffusion":
-                        output = pool.poll_diffusion_output(replica_id)
-                        if output is None:
-                            continue
+                    # Shared catch so a dead replica on either poll path is
+                    # evicted rather than tearing down every stage (#4285).
+                    try:
+                        if pool.stage_type == "diffusion":
+                            diffusion_output = pool.poll_diffusion_output(replica_id)
+                            if diffusion_output is None:
+                                continue
 
-                        pool.record_output_timestamps([output])
-                        await self._handle_processed_outputs(stage_id, replica_id, [output])
-                        idle = False
-                    else:
-                        try:
+                            pool.record_output_timestamps([diffusion_output])
+                            processed = [diffusion_output]
+                        else:
                             raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
                             if raw_outputs is None:
                                 continue
@@ -732,7 +723,7 @@ class Orchestrator:
                             # other (stage, replica) pairs in the same 1s window.
                             record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
                             iteration_stats = IterationStats() if record_stats else None
-                            raw_output = await pool.process_llm_raw_outputs(
+                            processed = await pool.process_llm_raw_outputs(
                                 replica_id,
                                 raw_outputs,
                                 iteration_stats=iteration_stats,
@@ -743,23 +734,23 @@ class Orchestrator:
                                     iteration_stats,
                                     engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
                                 )
-                        except asyncio.CancelledError:
-                            raise
-                        except EngineDeadError as e:
-                            await self._handle_dead_replica(stage_id, replica_id, e)
-                            continue
-                        except Exception:
-                            if self._shutdown_event.is_set():
-                                return
-                            logger.exception(
-                                "[Orchestrator] Stage-%s replica-%s processing failed",
-                                stage_id,
-                                replica_id,
-                            )
-                            raise
+                    except asyncio.CancelledError:
+                        raise
+                    except EngineDeadError as e:
+                        await self._handle_dead_replica(stage_id, replica_id, e)
+                        continue
+                    except Exception:
+                        if self._shutdown_event.is_set():
+                            return
+                        logger.exception(
+                            "[Orchestrator] Stage-%s replica-%s processing failed",
+                            stage_id,
+                            replica_id,
+                        )
+                        raise
 
-                        await self._handle_processed_outputs(stage_id, replica_id, raw_output)
-                        idle = False
+                    await self._handle_processed_outputs(stage_id, replica_id, processed)
+                    idle = False
 
             self._orch_monitor.note_loop(idle=idle)
             if idle:
@@ -1633,16 +1624,22 @@ class Orchestrator:
             _t_submit_start = _time.perf_counter()
 
             if next_pool.stage_type == "diffusion":
-                await next_pool.submit_initial(
-                    request_id,
-                    req_state,
-                    req_state.prompt,
-                    submit_kwargs={
-                        "kv_sender_info": self._build_kv_sender_info(
-                            list(getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]),
-                            request_id=request_id,
-                        )
-                    },
+                submit_kwargs = {
+                    "kv_sender_info": self._build_kv_sender_info(
+                        list(getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]),
+                        request_id=request_id,
+                    )
+                }
+                submitted = await self._dispatch_or_fail_request(
+                    lambda: next_pool.submit_initial(
+                        request_id,
+                        req_state,
+                        req_state.prompt,
+                        submit_kwargs=submit_kwargs,
+                    ),
+                    req_id=request_id,
+                    stage_id=next_stage_id,
+                    operation="async-chunk prewarm",
                 )
             else:
                 import copy
@@ -1672,12 +1669,22 @@ class Orchestrator:
                     resumable=downstream_resumable,
                 )
                 request.external_req_id = request.request_id
-                await next_pool.submit_initial(
-                    request_id,
-                    req_state,
-                    request,
-                    prompt_text=None,
+                submitted = await self._dispatch_or_fail_request(
+                    lambda: next_pool.submit_initial(
+                        request_id,
+                        req_state,
+                        request,
+                        prompt_text=None,
+                    ),
+                    req_id=request_id,
+                    stage_id=next_stage_id,
+                    operation="async-chunk prewarm",
                 )
+
+            # Attribute the failure to the stage that failed, not stage 0; the
+            # request is already cleaned up, so stop prewarming.
+            if not submitted:
+                return
 
             # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
             # replica is stage 0's bound replica (single-replica thinker in

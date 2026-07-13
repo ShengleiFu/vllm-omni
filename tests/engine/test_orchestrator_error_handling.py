@@ -26,6 +26,7 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -163,6 +164,28 @@ class _DieOnDemandLLMStageClient(FakeStageClient):
         if self.die:
             raise EngineDeadError(f"Stage-{self.stage_id} replica-{self.replica_id} is dead")
         return await super().get_output_async()
+
+
+class _DieOnDemandDiffusionStageClient(FakeStageClient):
+    """Diffusion stage replica that raises EngineDeadError on poll once ``die`` is set."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.die = False
+
+    def get_diffusion_output_nowait(self):
+        if self.die:
+            raise EngineDeadError(f"Stage-{self.stage_id} diffusion replica-{self.replica_id} is dead")
+        return super().get_diffusion_output_nowait()
+
+
+class _UnavailableDiffusionStageClient(FakeStageClient):
+    """Diffusion replica that stays live (so the pool keeps stage_type) but whose
+    dispatch fails with StageUnavailableError, as a downstream prewarm would when
+    its stage has no capacity."""
+
+    async def add_request_async(self, *args, **kwargs) -> None:
+        raise StageUnavailableError(f"stage {self.stage_id} has no live replica")
 
 
 @pytest.mark.asyncio
@@ -309,6 +332,79 @@ async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_f
         assert orchestrator_fixture.thread.is_alive()
         # Guard runs before registration, so the failed request never enters state.
         assert "req-after" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        if orchestrator_fixture.thread.is_alive():
+            orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+            orchestrator_fixture.thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_diffusion_replica_death_on_poll_keeps_server(orchestrator_factory) -> None:
+    """A diffusion stage replica raising EngineDeadError during poll must be
+    evicted while the orchestrator keeps serving. The per-replica catch has to
+    cover the diffusion polling path, not just the LLM one (#4285).
+    """
+    stage0 = _DieOnDemandDiffusionStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    stage_pools = _build_stage_pools([[stage0]])
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+    pool = orchestrator_fixture.orchestrator.stage_pools[0]
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-dit",
+            prompt={"prompt": "a cat"},
+            original_prompt={"prompt": "a cat"},
+            sampling_params_list=[OmniDiffusionSamplingParams()],
+            final_stage_id=0,
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+
+        stage0.die = True
+
+        error_msg = await _wait_for_error_message(orchestrator_fixture, request_id="req-dit")
+        assert error_msg.fatal is True
+        assert error_msg.stage_id == 0
+
+        await _wait_for(lambda: pool.live_replica_ids() == [])
+        assert orchestrator_fixture.thread.is_alive()
+        assert "req-dit" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        if orchestrator_fixture.thread.is_alive():
+            orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+            orchestrator_fixture.thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_prewarm_failure_reports_failing_downstream_stage(orchestrator_factory) -> None:
+    """When an async-chunk prewarm dispatch to a downstream stage fails, the
+    failure must be attributed to that stage, not stage 0 (the prewarm's own
+    dispatch stage). Regression for the guard using stage_id=0.
+    """
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="diffusion", final_output=False, final_output_type="image")
+    stage2 = _UnavailableDiffusionStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    stage_pools = _build_stage_pools([[stage0], [stage1], [stage2]])
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools, async_chunk=True)
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-x",
+            prompt=SimpleNamespace(request_id="req-x", prompt_token_ids=[1, 2, 3]),
+            original_prompt={"prompt": "a cat"},
+            sampling_params_list=[_sampling_params(), OmniDiffusionSamplingParams(), OmniDiffusionSamplingParams()],
+            final_stage_id=2,
+        )
+
+        error_msg = await _wait_for_error_message(orchestrator_fixture, request_id="req-x")
+        assert error_msg.fatal is True
+        assert error_msg.stage_id == 2
+        assert "Stage-2" in error_msg.error
+
+        # Stage 1 prewarm ran before the stage-2 failure; server stays up.
+        assert len(stage1.add_request_calls) == 1
+        assert orchestrator_fixture.thread.is_alive()
     finally:
         if orchestrator_fixture.thread.is_alive():
             orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
