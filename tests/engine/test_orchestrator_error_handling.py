@@ -661,6 +661,88 @@ async def test_fail_request_dead_stage_is_noop_safe_for_unregistered_request() -
             q.close()
 
 
+@pytest.mark.asyncio
+async def test_dispatch_death_evicts_so_subsequent_requests_reroute_to_survivor() -> None:
+    """A replica dying mid-submit (EngineDeadError from dispatch, before the poll
+    loop evicts it) is evicted by the guard so subsequent requests reroute to the
+    survivor instead of round-robining back onto the dead slot until the poll
+    catches up. The survivor and its request are untouched (#4285).
+    """
+    r0 = FakeStageClient(stage_type="llm")
+    r1 = FakeStageClient(stage_type="llm")
+    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[r0, r1]]))
+    try:
+        pool = orchestrator.stage_pools[0]
+        _register_request(orchestrator, "req-dead")
+        _register_request(orchestrator, "req-live")
+        assert pool.select_replica_id("req-dead") == 0
+        assert pool.select_replica_id("req-live") == 1
+
+        async def _die() -> None:
+            raise EngineDeadError("stage-0 replica-0 died on submit")
+
+        failed = await orchestrator._dispatch_or_fail_request(
+            _die, req_id="req-dead", stage_id=0, operation="add_request"
+        )
+        assert failed is False
+
+        # The dead replica is evicted; only the request on it fails, the survivor
+        # and its request are untouched.
+        assert pool.live_replica_ids() == [1]
+        assert r0.shutdown_calls == 1
+        assert r1.shutdown_calls == 0
+        msg = queues[1].async_q.get_nowait()
+        assert isinstance(msg, ErrorMessage) and msg.fatal is True and msg.request_id == "req-dead"
+        assert queues[1].async_q.empty()
+        assert "req-dead" not in orchestrator.request_states
+        assert "req-live" in orchestrator.request_states and pool.get_bound_replica_id("req-live") == 1
+
+        # The point of eviction: a burst of subsequent requests all route to the
+        # survivor and never land back on the evicted replica.
+        for rid in ("next-1", "next-2", "next-3"):
+            assert pool.select_replica_id(rid) == 1
+    finally:
+        for q in queues:
+            q.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_death_evicts_so_subsequent_requests_fast_fail() -> None:
+    """When the replica dying on submit was the stage's only one, the guard evicts
+    it (leaving the stage empty). A subsequent request then fast-fails at routing —
+    the ``_handle_add_request`` entry guard turns ``StageUnavailableError`` into a
+    fatal 5xx immediately, rather than dispatching onto the dead replica (#4285).
+    """
+    r0 = FakeStageClient(stage_type="llm")
+    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[r0]]))
+    try:
+        pool = orchestrator.stage_pools[0]
+        _register_request(orchestrator, "req-a")
+        assert pool.select_replica_id("req-a") == 0
+
+        async def _die() -> None:
+            raise EngineDeadError("stage-0 replica-0 died on submit")
+
+        failed = await orchestrator._dispatch_or_fail_request(_die, req_id="req-a", stage_id=0, operation="add_request")
+        assert failed is False
+
+        assert pool.live_replica_ids() == []
+        assert r0.shutdown_calls == 1
+        msg = queues[1].async_q.get_nowait()
+        assert isinstance(msg, ErrorMessage) and msg.request_id == "req-a"
+        assert queues[1].async_q.empty()
+        assert "req-a" not in orchestrator.request_states
+
+        # A subsequent request cannot be routed at all: the stage has no live
+        # replica, so selection raises fast instead of dispatching onto the dead
+        # slot. _handle_add_request converts this to a fatal 5xx at its entry guard.
+        with pytest.raises(StageUnavailableError):
+            pool.select_replica_id("req-next")
+    finally:
+        for q in queues:
+            q.close()
+
+
 # ───────── Diffusion stage error output routing ─────────
 
 

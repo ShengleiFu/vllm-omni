@@ -226,12 +226,26 @@ class OmniBase(PDDisaggregationMixin):
 
     @staticmethod
     def _replica_is_dead(client: StagePoolClient | None) -> bool:
+        """Whether a replica slot is evicted (``None``) or its engine is dead.
+
+        ``check_health()`` is the source of truth: it raises ``EngineDeadError``
+        when dead (inspecting the ``engine_dead`` flags internally), and the
+        diffusion client additionally runs a synchronous ``proc.is_alive()``
+        probe that catches a silent SIGKILL/segfault the monitor thread has not
+        flagged yet — so ``/health`` does not report 200 for a stage whose
+        subprocess is already dead. A client exposing no ``check_health`` cannot
+        confirm liveness, so it is treated as dead (fail closed).
+        """
         if client is None:
             return True
-        if getattr(client, "_engine_dead", False):
+        check_health = getattr(client, "check_health", None)
+        if not callable(check_health):
             return True
-        resources = getattr(client, "resources", None)
-        return resources is not None and getattr(resources, "engine_dead", False)
+        try:
+            check_health()
+        except EngineDeadError:
+            return True
+        return False
 
     def _live_replica_count(self, pool: StagePool) -> int:
         """Number of replicas in ``pool`` that are neither evicted nor dead.

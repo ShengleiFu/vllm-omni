@@ -1100,14 +1100,19 @@ async def test_async_omni_propagates_engine_generate_error(monkeypatch: pytest.M
 def test_check_health_passes_when_all_healthy():
     base = _make_base()
     base.engine.is_alive.return_value = True
-    base.engine.stage_pools = [_FakeStagePool([SimpleNamespace()])]
+    healthy_stage = SimpleNamespace(check_health=lambda: None)
+    base.engine.stage_pools = [_FakeStagePool([healthy_stage])]
     base.check_health()  # should not raise
 
 
 def test_check_health_raises_when_stage_dead():
     base = _make_base()
     base.engine.is_alive.return_value = True
-    dead_stage = SimpleNamespace(_engine_dead=True)
+
+    def _raise_dead() -> None:
+        raise EngineDeadError("Stage-1 engine core is dead")
+
+    dead_stage = SimpleNamespace(check_health=_raise_dead)
     base.engine.stage_pools = [_FakeStagePool([dead_stage], stage_id=1)]
     with pytest.raises(EngineDeadError, match="Stage-1"):
         base.check_health()

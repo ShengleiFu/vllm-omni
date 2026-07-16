@@ -1237,9 +1237,12 @@ class StagePool:
         it (per-replica fault isolation). The slot is left as a ``None`` hole,
         consistent with ``num_replicas``.
         """
-        # replica_id always comes from live_replica_ids() (a valid, live index);
-        # assert the invariant rather than silently no-op'ing an out-of-range id,
-        # which would leave a dead replica in the live set and break isolation.
-        assert 0 <= replica_id < len(self.clients), f"evict_replica: replica_id {replica_id} out of range"
+        # replica_id should always come from live_replica_ids() (a valid, live
+        # index). Fail loud on an out-of-range id rather than letting a negative
+        # index wrap or IndexError on the next line; an ``assert`` would be
+        # stripped under ``python -O``, silently leaving a dead replica in the
+        # live set and breaking isolation.
+        if not 0 <= replica_id < len(self.clients):
+            raise ValueError(f"evict_replica: replica_id {replica_id} out of range (num_replicas={len(self.clients)})")
         self.shutdown_replica(replica_id)
         self.clients[replica_id] = None

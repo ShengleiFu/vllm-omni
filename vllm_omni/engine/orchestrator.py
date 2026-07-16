@@ -586,6 +586,7 @@ class Orchestrator:
             req_id=parent_id,
             stage_id=0,
             operation=f"companion {companion_id}",
+            dispatch_req_id=companion_id,
         ):
             return
 
@@ -888,6 +889,7 @@ class Orchestrator:
         req_id: str,
         stage_id: int,
         operation: str,
+        dispatch_req_id: str | None = None,
     ) -> bool:
         """Run a dispatch action, converting stage unavailability into a
         single-request failure.
@@ -903,19 +905,46 @@ class Orchestrator:
         it). Both mean "this request cannot be placed", not "the server is
         broken": fail the request and keep serving (#4285). Unrelated errors
         propagate. Returns False when the request was failed.
+
+        ``req_id`` is the request the failure is attributed to; ``dispatch_req_id``
+        is the id actually being dispatched when it differs (e.g. a CFG companion
+        submitted under its parent's attribution) and is used to locate the
+        replica that died.
         """
         try:
             await dispatch()
             return True
-        except (StageUnavailableError, EngineDeadError) as e:
+        except StageUnavailableError as e:
+            # No specific replica to evict: the stage already has no live
+            # replica or the chosen slot was evicted. Fail just this request.
             logger.error(
-                "[Orchestrator] %s dispatch for req=%s raced stage-%s replica eviction: %s",
+                "[Orchestrator] %s dispatch for req=%s hit unavailable stage-%s: %s",
                 operation,
                 req_id,
                 stage_id,
                 e,
             )
             await self._fail_request_dead_stage(req_id, stage_id)
+            return False
+        except EngineDeadError as e:
+            # A live replica died mid-submit before the poll loop evicted it.
+            # Evict it now (and fail every request bound to it) so a burst of
+            # new requests stops round-robining onto the dead slot until the
+            # poll catches up. Capture the replica before failing this request,
+            # since the failure releases its binding.
+            pool = self.stage_pools[stage_id]
+            dead_replica = pool.get_bound_replica_id(dispatch_req_id or req_id)
+            logger.error(
+                "[Orchestrator] %s dispatch for req=%s hit dead stage-%s replica-%s: %s",
+                operation,
+                req_id,
+                stage_id,
+                dead_replica,
+                e,
+            )
+            await self._fail_request_dead_stage(req_id, stage_id)
+            if dead_replica is not None and dead_replica in pool.live_replica_ids():
+                await self._handle_dead_replica(stage_id, dead_replica, e)
             return False
 
     # ---- Shared helpers ----
