@@ -68,8 +68,9 @@ def talker2code2wav_async_chunk(
     if isinstance(multimodal_output, Mapping):
         frame = _extract_last_frame(multimodal_output)
         if frame is not None:
-            codec_codes = frame.cpu().tolist()
-            transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+            # Accumulate on-device; the host copy is deferred off the per-step
+            # path to one transfer per emitted chunk (see qwen3_omni).
+            transfer_manager.code_prompt_token_ids[request_id].append(frame)
         ref_code = multimodal_output.get("codes", {}).get("ref")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
             request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
@@ -200,17 +201,17 @@ def talker2code2wav_async_chunk(
             ref_context_request_id = request_id
             emitted_chunks = int(transfer_manager.put_req_chunk.get(request_id, 0))
             if emitted_chunks <= 0:
-                ref_frames = ref_context.tolist()
-                window_frames = ref_frames + window_frames
                 ref_context_included = True
             left_context_size += ref_context_size
 
-    num_quantizers = len(window_frames[0])
-    num_frames = len(window_frames)
-    code_predictor_codes = torch.tensor(
-        [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)],
-        dtype=torch.long,
-    )
+    # Flatten the [frames, quantizers] window to codebook-major layout with a
+    # single vectorized transpose instead of a per-element Python loop. Frames
+    # are accumulated on-device; the ref context (a host tensor) is aligned to
+    # the window device before it is prepended.
+    window = torch.stack(window_frames)
+    if ref_context_included:
+        window = torch.cat([ref_context.to(window.device, dtype=torch.long), window], dim=0)
+    code_predictor_codes = window.transpose(0, 1).reshape(-1)
 
     meta = MetaStruct(
         left_context_size=left_context_size,

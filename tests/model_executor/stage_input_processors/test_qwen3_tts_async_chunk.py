@@ -23,6 +23,11 @@ _FRAME = [1, 2, 3, 4]
 _Q = len(_FRAME)
 
 
+def _frames(n):
+    """Per-frame code tensors, matching the accumulator's list[torch.Tensor] type."""
+    return [torch.tensor(_FRAME, dtype=torch.long) for _ in range(n)]
+
+
 def _req(rid, *, finished, initial_codec_chunk_frames=None):
     ai = None
     if initial_codec_chunk_frames is not None:
@@ -54,7 +59,7 @@ def _tm(*, chunk_frames=25, left_context=25, max_num_seqs=1, initial_chunk_frame
 
 
 def _call(tm, rid, *, n_frames, finished=False, req_ic=None):
-    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(n_frames)]
+    tm.code_prompt_token_ids[rid] = _frames(n_frames)
     return talker2code2wav_async_chunk(
         transfer_manager=tm,
         multimodal_output={"codes": {"audio": torch.zeros((0,))}},
@@ -87,7 +92,7 @@ def test_eof_marker_when_finished_empty():
 
 def test_flush_on_finish():
     tm = _tm()
-    tm.code_prompt_token_ids["r"] = [_FRAME[:] for _ in range(24)]
+    tm.code_prompt_token_ids["r"] = _frames(24)
     p = talker2code2wav_async_chunk(
         transfer_manager=tm,
         multimodal_output=None,
@@ -258,7 +263,7 @@ def test_max_ic_for_chunk_size(chunk_size, expected):
 def test_first_streaming_chunk_prepends_ref_code_context():
     tm = _tm()
     rid = "r-ref"
-    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(10)]
+    tm.code_prompt_token_ids[rid] = _frames(10)
     ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
 
     payload = talker2code2wav_async_chunk(
@@ -280,7 +285,7 @@ def test_followup_ref_code_context_is_sent_as_metadata_handle():
     """Follow-up chunks keep full ref context semantically without resending it."""
     tm = _tm()
     rid = "r-ref2"
-    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(35)]
+    tm.code_prompt_token_ids[rid] = _frames(35)
     tm.put_req_chunk[rid] = 1
     ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
     tm.request_payload[rid] = ref_code
@@ -305,7 +310,7 @@ def test_followup_ref_code_context_is_sent_as_metadata_handle():
 def test_streaming_ref_code_context_is_bounded_for_batchable_shapes():
     tm = _tm(chunk_frames=4, left_context=3, initial_chunk_frames=4)
     rid = "r-ref-bounded"
-    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(8)]
+    tm.code_prompt_token_ids[rid] = _frames(8)
     ref_code = torch.tensor(
         [
             [1, 1, 1, 1],
@@ -366,6 +371,45 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
     assert payload.meta.left_context_size == 2
     assert len(payload.codes.audio) == _Q * 12
     assert rid in tm.request_payload
+
+
+def test_async_chunk_flatten_is_codebook_major_over_distinct_frames():
+    """Pin the exact codebook-major layout of an emitted chunk.
+
+    Frames are fed through the real per-step append path (not injected into the
+    accumulator directly) so this covers frame accumulation and window
+    flattening end to end; ``test_streaming_phases`` only checks lengths.
+    """
+    tm = _tm(chunk_frames=3, left_context=0, initial_chunk_frames=3)
+    rid = "r-order"
+    payload = None
+    for f in ([10, 20, 30, 40], [11, 21, 31, 41], [12, 22, 32, 42]):
+        payload = talker2code2wav_async_chunk(
+            transfer_manager=tm,
+            multimodal_output={"codes": {"audio": torch.tensor([f], dtype=torch.long)}},
+            request=_req(rid, finished=False, initial_codec_chunk_frames=3),
+            is_finished=False,
+        )
+    assert payload is not None
+    assert payload.codes.audio.tolist() == [10, 11, 12, 20, 21, 22, 30, 31, 32, 40, 41, 42]
+
+
+def test_async_chunk_skips_all_zero_frame():
+    """An all-zero take is degenerate: it must not accumulate or count toward the
+    chunk boundary (parity with the full-payload/token-only zero-row filter)."""
+    tm = _tm(chunk_frames=3, left_context=0, initial_chunk_frames=3)
+    rid = "r-zero"
+    payload = None
+    for f in ([1, 2, 3, 4], [0, 0, 0, 0], [5, 6, 7, 8]):
+        payload = talker2code2wav_async_chunk(
+            transfer_manager=tm,
+            multimodal_output={"codes": {"audio": torch.tensor([f], dtype=torch.long)}},
+            request=_req(rid, finished=False, initial_codec_chunk_frames=3),
+            is_finished=False,
+        )
+    # only the two non-zero frames were accumulated -> size-3 chunk not ready
+    assert payload is None
+    assert len(tm.code_prompt_token_ids[rid]) == 2
 
 
 def test_non_async_token_only_sizes_placeholder_for_ref_and_audio_frames():
