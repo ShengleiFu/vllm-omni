@@ -394,9 +394,9 @@ def test_async_chunk_flatten_is_codebook_major_over_distinct_frames():
     assert payload.codes.audio.tolist() == [10, 11, 12, 20, 21, 22, 30, 31, 32, 40, 41, 42]
 
 
-def test_async_chunk_skips_all_zero_frame():
-    """An all-zero take is degenerate: it must not accumulate or count toward the
-    chunk boundary (parity with the full-payload/token-only zero-row filter)."""
+def test_async_chunk_filters_all_zero_frame_at_emit():
+    """b-safe: all-zero frames are accumulated with no per-step sync, then dropped
+    from the emitted chunk in one vectorized pass (like the batch-path filter)."""
     tm = _tm(chunk_frames=3, left_context=0, initial_chunk_frames=3)
     rid = "r-zero"
     payload = None
@@ -407,9 +407,11 @@ def test_async_chunk_skips_all_zero_frame():
             request=_req(rid, finished=False, initial_codec_chunk_frames=3),
             is_finished=False,
         )
-    # only the two non-zero frames were accumulated -> size-3 chunk not ready
-    assert payload is None
-    assert len(tm.code_prompt_token_ids[rid]) == 2
+    # all 3 frames accumulated (no per-step skip); the zero row is filtered from
+    # the emitted codes -> codebook-major over the 2 real frames only.
+    assert len(tm.code_prompt_token_ids[rid]) == 3
+    assert payload is not None
+    assert payload.codes.audio.tolist() == [1, 5, 2, 6, 3, 7, 4, 8]
 
 
 def test_non_async_token_only_sizes_placeholder_for_ref_and_audio_frames():

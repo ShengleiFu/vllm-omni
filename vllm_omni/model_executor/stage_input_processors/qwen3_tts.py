@@ -43,10 +43,9 @@ def _extract_last_frame(multimodal_output: OmniPayload | dict[str, Any]) -> torc
     if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
         return None
     if audio_codes.ndim == 2:
-        frame = audio_codes[-1]
-        if frame.numel() == 0 or not bool(frame.any().item()):
-            return None
-        return frame.to(torch.long).reshape(-1)
+        # Keep the newest frame on-device without a per-step content sync; zero-
+        # padded frames are dropped in one vectorized pass at chunk emit.
+        return audio_codes[-1].to(torch.long).reshape(-1)
     if audio_codes.ndim == 1:
         return audio_codes.to(torch.long).reshape(-1)
     raise ValueError(f"Invalid audio_codes shape for Qwen3-TTS async_chunk: {tuple(audio_codes.shape)}")
@@ -161,7 +160,7 @@ def talker2code2wav_async_chunk(
         context_length = chunk_length if chunk_length != 0 else chunk_size
 
     end_index = min(length, left_context_size_config + context_length)
-    left_context_size = max(0, end_index - context_length)
+    raw_lc = max(0, end_index - context_length)
     window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
     # Prepend the bounded ref_code tail to the first emitted chunk so Code2Wav
@@ -202,15 +201,21 @@ def talker2code2wav_async_chunk(
             emitted_chunks = int(transfer_manager.put_req_chunk.get(request_id, 0))
             if emitted_chunks <= 0:
                 ref_context_included = True
-            left_context_size += ref_context_size
 
-    # Flatten the [frames, quantizers] window to codebook-major layout with a
-    # single vectorized transpose instead of a per-element Python loop. Frames
-    # are accumulated on-device; the ref context (a host tensor) is aligned to
-    # the window device before it is prepended.
+    # Drop zero-padded frames in one vectorized pass at emit (mirrors
+    # _filter_audio_codes_qwen3_tts) instead of a per-step `.any()` sync, then
+    # recompute the context split from the surviving frames so Code2Wav trims the
+    # correct overlap. Flatten to codebook-major with a single transpose. Frames
+    # are on-device; the ref context (a host tensor) is aligned before prepending.
     window = torch.stack(window_frames)
+    valid = window.any(dim=1)
+    left_context_size = int(valid[:raw_lc].sum())
+    window = window[valid]
     if ref_context_included:
         window = torch.cat([ref_context.to(window.device, dtype=torch.long), window], dim=0)
+    # ref_context_size is 0 when there is no ref; add it whether or not the ref
+    # frames were prepended -- follow-up chunks carry it as a metadata handle.
+    left_context_size += ref_context_size
     code_predictor_codes = window.transpose(0, 1).reshape(-1)
 
     meta = MetaStruct(
