@@ -3,7 +3,11 @@ import torch
 
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.cuda,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device"),
+]
 
 NUM_BLOCKS = 10
 BLOCK_SIZE = 4

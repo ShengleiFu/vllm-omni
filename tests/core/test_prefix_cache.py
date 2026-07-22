@@ -3,6 +3,8 @@ import torch
 
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 DEFAULT_SEQ_LEN = 15
 NUM_BLOCKS = 10
 BLOCK_SIZE = 4
@@ -695,11 +697,21 @@ def test_get_merged_multimodal_outputs(feat_dims, num_tokens_padded, mocker):
             assert torch.all(req2_merged_mm_outputs == req2_new_mm_outputs)
 
 
-def test_get_merged_multimodal_outputs_slices_passthrough_tensor_per_request(mocker):
-    """A passthrough key that is itself a real 2D tensor (not the string/list
+@pytest.mark.parametrize(
+    "passthrough_shape",
+    [(5,), (5, 3)],
+    ids=["1d_token_metadata", "2d_feature_tensor"],
+)
+def test_get_merged_multimodal_outputs_slices_passthrough_tensor_per_request(passthrough_shape, mocker):
+    """A passthrough key that is itself a real tensor (not the string/list
     passthrough already covered above) must be sliced per request through
     to_payload_element's tensor branch, under the same mixed cache
     hit/miss + uneven scheduled-length batch as test_get_merged_multimodal_outputs.
+
+    Covers both a 1D token-aligned metadata tensor (e.g. ref_code_len,
+    codec_streaming -- shape (total_tokens,)) and a 2D per-token feature
+    tensor (shape (total_tokens, feat_dim)), since W2's batching could
+    easily special-case one and silently mishandle the other.
     """
     feat_dims = {"foo": 100, "bar": 100}
     cache = get_omni_pcache_with_mm_tensors(feat_dims, seq_len=DEFAULT_SEQ_LEN)
@@ -736,7 +748,10 @@ def test_get_merged_multimodal_outputs_slices_passthrough_tensor_per_request(moc
             dtype=DTYPE,
         )
     total_scheduled_tokens = num_new_toks_req1 + num_new_toks_req2
-    passthrough_tensor = torch.arange(total_scheduled_tokens * 3, dtype=DTYPE).reshape(total_scheduled_tokens, 3)
+    assert passthrough_shape[0] == total_scheduled_tokens
+    passthrough_tensor = torch.arange(int(torch.prod(torch.tensor(passthrough_shape))), dtype=DTYPE).reshape(
+        passthrough_shape
+    )
     new_mm_outputs["passthrough_tensor"] = passthrough_tensor
 
     input_batch = MockInputBatch(num_computed_tokens_cpu=torch.Tensor([orig_num_tokens_unpadded, 0]))
@@ -760,5 +775,3 @@ def test_get_merged_multimodal_outputs_slices_passthrough_tensor_per_request(moc
     # any cached history (unlike the mm_cache_keys tensors above).
     assert torch.equal(passthrough_out["req1"], passthrough_tensor[0:num_new_toks_req1])
     assert torch.equal(passthrough_out["req2"], passthrough_tensor[num_new_toks_req1:total_scheduled_tokens])
-    # The two slices must not alias/overlap in content.
-    assert not torch.equal(passthrough_out["req1"], passthrough_out["req2"])
