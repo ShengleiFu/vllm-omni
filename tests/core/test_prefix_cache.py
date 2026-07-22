@@ -314,6 +314,103 @@ def test_deferred_multimodal_cache_write_commits_on_completion():
     assert torch.equal(rows[8:16], expected)
 
 
+def test_discard_deferred_mm_outputs_drops_pending_chunks():
+    """discard_deferred_mm_outputs is the abort path: a request that
+    leaves without a cache commit must not leak its staged chunks into
+    the cache if commit_deferred_mm_outputs is later called for it."""
+    cache = get_omni_pcache()
+    mm_key = "codes.audio"
+    block_table = torch.tensor(
+        [
+            [2, 3, 4, 5],
+            [6, 7, 8, 9],
+        ],
+        dtype=torch.long,
+    )
+    input_batch = MockInputBatch(
+        num_computed_tokens_cpu=torch.tensor([4, 0], dtype=torch.long),
+        block_table=block_table,
+    )
+
+    cache.update_omni_tensor_prefix_cache(
+        hidden_states=None,
+        multimodal_outputs={mm_key: torch.arange(8, dtype=torch.long).reshape(4, 2)},
+        num_tokens_unpadded=4,
+        slot_mapping=torch.arange(8, 12),
+        skip_mm_cache_keys={mm_key},
+    )
+
+    chunk = torch.arange(8, dtype=torch.long).reshape(4, 2)
+    cache.stage_deferred_mm_outputs(
+        query_start_loc=torch.tensor([0, 4], dtype=torch.long),
+        input_batch=input_batch,
+        multimodal_outputs={mm_key: chunk},
+        num_scheduled_tokens={"req1": 4, "req2": 0},
+        deferred_mm_cache_keys={mm_key},
+    )
+    assert "req1" in cache._deferred_mm_outputs
+
+    cache.discard_deferred_mm_outputs("req1")
+    assert "req1" not in cache._deferred_mm_outputs
+
+    # A later commit call for the now-discarded req_id must be a no-op,
+    # not a resurrection of the dropped chunk.
+    cache.commit_deferred_mm_outputs({"req1"}, input_batch)
+    rows = cache.mm_outputs_cache[mm_key].view(-1, 2)
+    assert torch.all(rows[8:12] == 0)
+
+
+def test_deferred_mm_outputs_request_id_reused_after_discard():
+    """A request ID reused after discard_deferred_mm_outputs must start
+    clean: the new occupant's committed data must not be mixed with the
+    previous (discarded) occupant's staged chunks."""
+    cache = get_omni_pcache()
+    mm_key = "codes.audio"
+    block_table = torch.tensor(
+        [
+            [2, 3, 4, 5],
+            [6, 7, 8, 9],
+        ],
+        dtype=torch.long,
+    )
+    input_batch = MockInputBatch(
+        num_computed_tokens_cpu=torch.tensor([4, 0], dtype=torch.long),
+        block_table=block_table,
+    )
+
+    cache.update_omni_tensor_prefix_cache(
+        hidden_states=None,
+        multimodal_outputs={mm_key: torch.arange(8, dtype=torch.long).reshape(4, 2)},
+        num_tokens_unpadded=4,
+        slot_mapping=torch.arange(8, 12),
+        skip_mm_cache_keys={mm_key},
+    )
+
+    stale_chunk = torch.full((4, 2), -1, dtype=torch.long)
+    cache.stage_deferred_mm_outputs(
+        query_start_loc=torch.tensor([0, 4], dtype=torch.long),
+        input_batch=input_batch,
+        multimodal_outputs={mm_key: stale_chunk},
+        num_scheduled_tokens={"req1": 4, "req2": 0},
+        deferred_mm_cache_keys={mm_key},
+    )
+    cache.discard_deferred_mm_outputs("req1")
+
+    # "req1" is reused by a brand-new request with different data.
+    fresh_chunk = torch.arange(8, dtype=torch.long).reshape(4, 2)
+    cache.stage_deferred_mm_outputs(
+        query_start_loc=torch.tensor([0, 4], dtype=torch.long),
+        input_batch=input_batch,
+        multimodal_outputs={mm_key: fresh_chunk},
+        num_scheduled_tokens={"req1": 4, "req2": 0},
+        deferred_mm_cache_keys={mm_key},
+    )
+    cache.commit_deferred_mm_outputs({"req1"}, input_batch)
+
+    rows = cache.mm_outputs_cache[mm_key].view(-1, 2)
+    assert torch.equal(rows[8:12], fresh_chunk)
+
+
 def test_deferred_multimodal_cache_can_be_merged_on_full_block_hit():
     cache = get_omni_pcache()
     mm_key = "codes.audio"
