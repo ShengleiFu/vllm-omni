@@ -721,3 +721,62 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
     assert torch.equal(output.inter_stage_outputs[0]["codes.audio"], codes[0:1])
     assert torch.equal(output.inter_stage_outputs[1]["codes.audio"], codes[1:2])
     assert output.multimodal_outputs is None
+
+
+def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkeypatch):
+    """When only a subset of req_ids_output_copy need the downstream
+    pooler payload, multimodal_outputs (not just hidden_states, which
+    test_build_omni_output_copies_hidden_for_partial_downstream_batch
+    already covers) must be attached only to the downstream requests, in
+    the right per-request slot -- a skipped middle request must not shift
+    a later request's slice onto the wrong index."""
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner.requests = {"r1": object(), "r2": object(), "r3": object()}
+    runner.omni_prefix_cache = object()
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("latent", ["r1", "r3"]),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "_deferred_prefix_cache_mm_keys", lambda self: {"codes.audio"})
+    monkeypatch.setattr(GPUARModelRunner, "_stage_deferred_prefix_cache_mm_outputs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_prepare_prefix_cache_pooler_payload_sources",
+        lambda *args, **kwargs: (None, None, None),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+
+    codes = torch.tensor([[11.0, 12.0], [21.0, 22.0], [31.0, 32.0]], dtype=torch.float32)
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=3,
+            num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
+        ),
+        hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={"codes.audio": codes},
+        req_ids_output_copy=["r1", "r2", "r3"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1, "r3": 2},
+        valid_sampled_token_ids=[[], [], []],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([1, 1, 1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.long),
+    )
+
+    assert torch.equal(output.inter_stage_outputs[0]["codes.audio"], codes[0:1])
+    assert output.inter_stage_outputs[1] is None
+    assert torch.equal(output.inter_stage_outputs[2]["codes.audio"], codes[2:3])
+    # r3's slice must not have shifted onto r2's would-be position.
+    assert not torch.equal(output.inter_stage_outputs[2]["codes.audio"], codes[1:2])

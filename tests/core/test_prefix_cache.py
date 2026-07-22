@@ -693,3 +693,72 @@ def test_get_merged_multimodal_outputs(feat_dims, num_tokens_padded, mocker):
 
             assert req2_merged_mm_outputs.shape == torch.Size([num_new_toks_req2, curr_feat_dim])
             assert torch.all(req2_merged_mm_outputs == req2_new_mm_outputs)
+
+
+def test_get_merged_multimodal_outputs_slices_passthrough_tensor_per_request(mocker):
+    """A passthrough key that is itself a real 2D tensor (not the string/list
+    passthrough already covered above) must be sliced per request through
+    to_payload_element's tensor branch, under the same mixed cache
+    hit/miss + uneven scheduled-length batch as test_get_merged_multimodal_outputs.
+    """
+    feat_dims = {"foo": 100, "bar": 100}
+    cache = get_omni_pcache_with_mm_tensors(feat_dims, seq_len=DEFAULT_SEQ_LEN)
+
+    orig_num_tokens_unpadded = 8
+    slot_offset = 8
+    orig_slot_mapping = torch.arange(slot_offset, slot_offset + orig_num_tokens_unpadded)
+    feature_dims = {key: val.shape[-1] for key, val in cache.mm_outputs_cache.items()}
+    orig_mm_outputs = {
+        key: torch.rand((orig_num_tokens_unpadded, feature_dims[key]), dtype=DTYPE) for key in cache.mm_cache_keys
+    }
+
+    cache.update_omni_tensor_prefix_cache(
+        hidden_states=None,
+        multimodal_outputs=orig_mm_outputs,
+        num_tokens_unpadded=orig_num_tokens_unpadded,
+        slot_mapping=orig_slot_mapping,
+        num_tokens_padded=None,
+    )
+
+    num_new_toks_req1 = 3
+    num_new_toks_req2 = 2
+    cache.add_prefix_cached_new_req_id("req1")
+
+    num_scheduled_tokens = {
+        "req1": num_new_toks_req1,
+        "req2": num_new_toks_req2,
+    }
+
+    new_mm_outputs = {}
+    for mm_key in cache.mm_cache_keys:
+        new_mm_outputs[mm_key] = torch.rand(
+            (num_new_toks_req1 + num_new_toks_req2, feature_dims[mm_key]),
+            dtype=DTYPE,
+        )
+    total_scheduled_tokens = num_new_toks_req1 + num_new_toks_req2
+    passthrough_tensor = torch.arange(total_scheduled_tokens * 3, dtype=DTYPE).reshape(total_scheduled_tokens, 3)
+    new_mm_outputs["passthrough_tensor"] = passthrough_tensor
+
+    input_batch = MockInputBatch(num_computed_tokens_cpu=torch.Tensor([orig_num_tokens_unpadded, 0]))
+
+    mocker.patch(
+        "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_cached_block_ids",
+        new=fake_get_cached_block_ids,
+    )
+    merged_mm_outputs = cache.get_merged_multimodal_states(
+        query_start_loc=[0, num_new_toks_req1],
+        input_batch=input_batch,
+        multimodal_outputs=new_mm_outputs,
+        num_scheduled_tokens=num_scheduled_tokens,
+    )
+
+    assert "passthrough_tensor" not in cache.mm_cache_keys
+
+    passthrough_out = merged_mm_outputs["passthrough_tensor"]
+    # req1 (cache hit) gets tokens [0:3), req2 (cache miss) gets tokens [3:5) --
+    # a passthrough tensor is sliced by scheduled position, not merged with
+    # any cached history (unlike the mm_cache_keys tensors above).
+    assert torch.equal(passthrough_out["req1"], passthrough_tensor[0:num_new_toks_req1])
+    assert torch.equal(passthrough_out["req2"], passthrough_tensor[num_new_toks_req1:total_scheduled_tokens])
+    # The two slices must not alias/overlap in content.
+    assert not torch.equal(passthrough_out["req1"], passthrough_out["req2"])
