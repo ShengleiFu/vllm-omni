@@ -365,8 +365,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def is_done_receiving_chunks(self, request_id: str) -> bool:
         """Return True if the request should stop polling upstream chunks.
 
-        Neither marker means this stage's own generation is done -- see
-        vllm-project/vllm-omni#5349.
+        Covers both the whole-request marker (``upstream_exhausted_requests``)
+        and the per-segment marker (``segment_finished_requests``) used while
+        waiting for the next streaming input slice. Neither means this
+        stage's own generation is done -- see vllm-project/vllm-omni#5349.
         """
         return request_id in self.upstream_exhausted_requests or request_id in self.segment_finished_requests
 
