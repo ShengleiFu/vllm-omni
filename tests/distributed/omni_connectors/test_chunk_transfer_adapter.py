@@ -136,7 +136,7 @@ def test_load_poll(build_adapter):
     assert request.additional_information == payload
     assert adapter.get_req_chunk["req-1"] == 1
     assert "req-1" in adapter._finished_load_reqs
-    assert "req-1" in adapter.upstream_finished_requests
+    assert "req-1" in adapter.upstream_exhausted_requests
     assert "req-1" not in adapter._pending_load_reqs
 
 
@@ -355,7 +355,7 @@ def test_load_poll_non_ar_merges_into_existing_additional_information(build_adap
     assert request.additional_information["meta"]["phase"] == "decode"
     assert request.additional_information["kv_metadata"] == {"foo": "bar"}
     assert "req-non-ar" in adapter._finished_load_reqs
-    assert "req-non-ar" in adapter.upstream_finished_requests
+    assert "req-non-ar" in adapter.upstream_exhausted_requests
 
 
 def test_load_poll_ar_request_additional_information_concats_tensors(build_adapter):
@@ -490,7 +490,7 @@ def test_postprocess_scheduler_output(build_adapter):
 def test_active_stream_window_stalls_lone_running_request_after_upstream_finishes(build_adapter, model_mode):
     """Regression test for vllm-project/vllm-omni#5349.
 
-    upstream_finished_requests means the upstream sent its terminal chunk,
+    upstream_exhausted_requests means the upstream sent its terminal chunk,
     not that this stage's own generation is done. A downstream stage can
     still have a long decode ahead after its upstream finishes. Evicting on
     that signal and then permanently denying re-admission wedges the
@@ -514,7 +514,7 @@ def test_active_stream_window_stalls_lone_running_request_after_upstream_finishe
     adapter.requests_with_ready_chunks.add("req-1")
 
     # Upstream terminal chunk arrives; this stage hasn't finished.
-    adapter.upstream_finished_requests.add("req-1")
+    adapter.upstream_exhausted_requests.add("req-1")
     scheduler_output = SimpleNamespace(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(req_ids=["req-1"]),
@@ -562,7 +562,7 @@ def test_cleanup_receiver_releases_multiple_slots_in_sequence(build_adapter):
 
 def _populate_adapter_state(adapter, req_id="req-1", ext_id="ext-1"):
     """Fill every per-request structure so cleanup can be verified."""
-    adapter.upstream_finished_requests.add(req_id)
+    adapter.upstream_exhausted_requests.add(req_id)
     adapter._active_streams[req_id] = SimpleNamespace(request_id=req_id)
     adapter.get_req_chunk[req_id] = 3
     adapter.requests_with_ready_chunks.add(req_id)
@@ -583,7 +583,7 @@ def test_cleanup_clears_all_state(build_adapter):
 
     adapter.cleanup(req_id, ext_id)
 
-    assert req_id not in adapter.upstream_finished_requests
+    assert req_id not in adapter.upstream_exhausted_requests
     assert req_id not in adapter._active_streams
     assert req_id not in adapter.get_req_chunk
     assert req_id not in adapter.requests_with_ready_chunks
@@ -636,7 +636,7 @@ def test_cleanup_request_id_reuse_not_polluted(build_adapter):
 
     adapter.cleanup(req_id, ext_id)
 
-    assert req_id not in adapter.upstream_finished_requests
+    assert req_id not in adapter.upstream_exhausted_requests
     assert req_id not in adapter.get_req_chunk
 
 
@@ -662,7 +662,7 @@ def test_cleanup_only_affects_target_request(build_adapter):
 
     adapter.cleanup("req-a", "ext-a")
 
-    assert "req-b" in adapter.upstream_finished_requests
+    assert "req-b" in adapter.upstream_exhausted_requests
     assert "req-b" in adapter.get_req_chunk
     assert "ext-b" in adapter.put_req_chunk
     assert "ext-b" in adapter.request_payload
@@ -685,13 +685,13 @@ def test_cleanup_after_poll_flow(build_adapter):
     connector.get.return_value = (payload, 8)
     adapter._poll_single_request(request)
 
-    assert "req-flow" in adapter.upstream_finished_requests
+    assert "req-flow" in adapter.upstream_exhausted_requests
     assert adapter.get_req_chunk["req-flow"] == 1
     assert "req-flow" in adapter.request_ids_mapping
 
     adapter.cleanup("req-flow", "ext-flow")
 
-    assert "req-flow" not in adapter.upstream_finished_requests
+    assert "req-flow" not in adapter.upstream_exhausted_requests
     assert "req-flow" not in adapter.get_req_chunk
     assert "req-flow" not in adapter.request_ids_mapping
     assert "ext-flow" not in adapter.request_payload
@@ -725,7 +725,7 @@ def test_finish_requests_removes_zombies_from_chunk_waiting_deques(build_adapter
     adapter.waiting_for_chunk_waiting_requests = deque([zombie, other])
     adapter.waiting_for_chunk_running_requests = deque([other, zombie])
     adapter.requests_with_ready_chunks.add("req-zombie")
-    adapter.upstream_finished_requests.add("req-zombie")
+    adapter.upstream_exhausted_requests.add("req-zombie")
     requests_map = {
         "req-zombie": zombie,
         "req-live": other,
@@ -740,7 +740,7 @@ def test_finish_requests_removes_zombies_from_chunk_waiting_deques(build_adapter
     assert [req.request_id for req in adapter.waiting_for_chunk_waiting_requests] == ["req-live"]
     assert [req.request_id for req in adapter.waiting_for_chunk_running_requests] == ["req-live"]
     assert "req-zombie" not in adapter.requests_with_ready_chunks
-    assert "req-zombie" not in adapter.upstream_finished_requests
+    assert "req-zombie" not in adapter.upstream_exhausted_requests
 
 
 def test_finish_requests_releases_active_stream_slot(build_adapter):
@@ -806,7 +806,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
     cleanup_calls = []
 
     adapter_mock = mocker.MagicMock()
-    adapter_mock.upstream_finished_requests = {"req-s1"}
+    adapter_mock.upstream_exhausted_requests = {"req-s1"}
     adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
 
     from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -1042,7 +1042,7 @@ def test_wire_round_trip_struct_to_dict_contract():
 def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
     """Build a mock scheduler with requests queued for deferred finish."""
     adapter_mock = mocker.MagicMock()
-    adapter_mock.upstream_finished_requests = {r.request_id for r in pending_finish_reqs}
+    adapter_mock.upstream_exhausted_requests = {r.request_id for r in pending_finish_reqs}
     cleanup_calls = []
     adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
 

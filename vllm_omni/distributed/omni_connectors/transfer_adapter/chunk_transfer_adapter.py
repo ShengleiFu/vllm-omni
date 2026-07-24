@@ -68,7 +68,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # mapping for request id and chunk id
         self.put_req_chunk: dict[str, int] = defaultdict(int)
         self.get_req_chunk: dict[str, int] = defaultdict(int)
-        self.upstream_finished_requests: set[str] = set()
+        self.upstream_exhausted_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
         self.request_payload = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
@@ -229,13 +229,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     construct_next_stage_streaming_input_prompt(payload_data, request)
 
                 if payload_finished:
-                    self.upstream_finished_requests.add(req_id)
+                    self.upstream_exhausted_requests.add(req_id)
                     request.resumable = False
                 if payload_segment_finished:
                     self.segment_finished_requests.add(req_id)
             else:
                 if payload_finished:
-                    self.upstream_finished_requests.add(req_id)
+                    self.upstream_exhausted_requests.add(req_id)
                     request.resumable = False
                 if payload_segment_finished:
                     self.segment_finished_requests.add(req_id)
@@ -368,7 +368,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Neither marker means this stage's own generation is done -- see
         vllm-project/vllm-omni#5349.
         """
-        return request_id in self.upstream_finished_requests or request_id in self.segment_finished_requests
+        return request_id in self.upstream_exhausted_requests or request_id in self.segment_finished_requests
 
     ########################################################################
     # Cleanup
@@ -384,7 +384,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
         self._active_streams.pop(request_id, None)
-        self.upstream_finished_requests.discard(request_id)
+        self.upstream_exhausted_requests.discard(request_id)
         self.segment_finished_requests.discard(request_id)
         self.get_req_chunk.pop(request_id, None)
         self.requests_with_ready_chunks.discard(request_id)
@@ -749,7 +749,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         for req_id in request_ids:
             self._active_streams.pop(req_id, None)
             self.requests_with_ready_chunks.discard(req_id)
-            self.upstream_finished_requests.discard(req_id)
+            self.upstream_exhausted_requests.discard(req_id)
             self._finished_load_reqs.discard(req_id)
             self._cancelled_load_reqs.add(req_id)
 
