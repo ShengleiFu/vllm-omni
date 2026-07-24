@@ -40,8 +40,8 @@ def _make_scheduler(*, chunk_transfer_adapter=None) -> OmniARScheduler:
 
 
 class _FakeFinishedRequest:
-    """Not a SimpleNamespace: it defines __eq__, making instances unhashable,
-    and _free_request() puts the request in a set."""
+    """Not a SimpleNamespace: SimpleNamespace defines __eq__, which makes it
+    unhashable, and _free_request() puts the request in a set."""
 
     def __init__(self, request_id: str) -> None:
         self.request_id = request_id
