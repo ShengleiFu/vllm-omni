@@ -1,16 +1,8 @@
-"""Unit tests for OmniARScheduler._free_request() chunk-transfer-adapter cleanup.
-
-Regression tests for vllm-project/vllm-omni#5349 (P1 follow-up): normal EOS
-completion goes through _free_request(), NOT OmniARScheduler.finish_requests()
--- the latter is the external abort/cancel entry point per its own docstring
-("Handles the finish signal from outside the scheduler. For example, the API
-server can abort a request when the client disconnects."). Without a
-chunk_transfer_adapter.cleanup_receiver() call in _free_request(), a request
-that finishes normally never leaves self._active_streams: after K requests
-complete normally, the bounded-K active-stream window is permanently
-exhausted by stale entries and every request after the K-th wedges exactly
-like the original #5349 stall -- just delayed to the (K+1)-th request instead
-of the 1st.
+"""Regression tests for vllm-project/vllm-omni#5349 (P1): normal completion
+goes through _free_request(), not finish_requests() (the external
+abort/cancel entry point). Without a cleanup_receiver() call there,
+_active_streams never releases on ordinary completion, so the bounded-K
+window fills with stale entries after K completions.
 """
 
 from __future__ import annotations
@@ -31,10 +23,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _make_scheduler(*, chunk_transfer_adapter=None) -> OmniARScheduler:
-    """Minimal OmniARScheduler stand-in exercising only _free_request()'s
-    "no KV transfer needed" happy path -- the common case for a plain
-    text/audio-token generation stage with no PD-disaggregation KV transfer
-    configured."""
+    """Minimal OmniARScheduler exercising _free_request()'s no-KV-transfer
+    happy path."""
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._omits_kv_transfer_cache = {}
     sched._connector_finished = lambda request: (False, None)
@@ -50,12 +40,8 @@ def _make_scheduler(*, chunk_transfer_adapter=None) -> OmniARScheduler:
 
 
 class _FakeFinishedRequest:
-    """A minimal finished Request stand-in.
-
-    Deliberately not a SimpleNamespace: SimpleNamespace defines __eq__, which
-    makes instances unhashable (hash=None) -- and _free_request() puts the
-    request into a set (self._inflight_prefills.discard(request)).
-    """
+    """Not a SimpleNamespace: it defines __eq__, making instances unhashable,
+    and _free_request() puts the request in a set."""
 
     def __init__(self, request_id: str) -> None:
         self.request_id = request_id
@@ -79,8 +65,7 @@ def test_free_request_releases_chunk_transfer_adapter_receiver_state():
 
 
 def test_free_request_is_safe_without_a_chunk_transfer_adapter():
-    """Most stages run without chunk transfer (no downstream connector);
-    _free_request() must not assume chunk_transfer_adapter is set."""
+    """Most stages have no chunk transfer adapter configured."""
     sched = _make_scheduler(chunk_transfer_adapter=None)
     request = _make_finished_request("req-1")
 

@@ -136,7 +136,7 @@ def test_load_poll(build_adapter):
     assert request.additional_information == payload
     assert adapter.get_req_chunk["req-1"] == 1
     assert "req-1" in adapter._finished_load_reqs
-    assert "req-1" in adapter.finished_requests
+    assert "req-1" in adapter.upstream_finished_requests
     assert "req-1" not in adapter._pending_load_reqs
 
 
@@ -355,7 +355,7 @@ def test_load_poll_non_ar_merges_into_existing_additional_information(build_adap
     assert request.additional_information["meta"]["phase"] == "decode"
     assert request.additional_information["kv_metadata"] == {"foo": "bar"}
     assert "req-non-ar" in adapter._finished_load_reqs
-    assert "req-non-ar" in adapter.finished_requests
+    assert "req-non-ar" in adapter.upstream_finished_requests
 
 
 def test_load_poll_ar_request_additional_information_concats_tensors(build_adapter):
@@ -416,15 +416,9 @@ def test_fifo_promotion(build_adapter):
     assert reqs[1].status == RequestStatus.WAITING_FOR_CHUNK
     assert reqs[2].status == RequestStatus.WAITING
 
-    # req-1 truly finishes -- this is the real production trigger (the
-    # vLLM scheduler calling finish_requests() once req-1 reaches a terminal
-    # status), which already frees its active-stream slot via the
-    # self._active_streams.pop() in finish_requests(). This replaces the old
-    # "adapter.finished_requests.add(...) + _evict_finished_active_streams(...)"
-    # simulation of "upstream sent its last chunk" -- see
-    # vllm-project/vllm-omni#5349 for why that signal must not be conflated
-    # with "this stage's own generation for req-1 is done".
-    adapter.finish_requests(["req-1"], RequestStatus.FINISHED_STOPPED, requests={"req-1": reqs[0]})
+    # Ordinary completion calls cleanup_receiver(), not finish_requests()
+    # (the abort path) -- see test_omni_ar_scheduler_free_request_cleanup.py.
+    adapter.cleanup_receiver("req-1")
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
     assert list(adapter._active_streams) == ["req-2", "req-3"]
@@ -463,9 +457,9 @@ def test_finished_releases_slot(build_adapter):
     assert list(adapter._active_streams) == ["req-1"]
     assert waiting_queue == [req_2]
 
-    # req-1 truly finishes (see test_fifo_promotion for why this replaces the
-    # old finished_requests + _evict_finished_active_streams simulation).
-    adapter.finish_requests(["req-1"], RequestStatus.FINISHED_STOPPED, requests={"req-1": req_1})
+    # req-1 finishes ordinarily (see test_fifo_promotion for why this is
+    # cleanup_receiver(), not finish_requests()).
+    adapter.cleanup_receiver("req-1")
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
     assert list(adapter._active_streams) == ["req-2"]
@@ -496,34 +490,20 @@ def test_postprocess_scheduler_output(build_adapter):
 def test_active_stream_window_stalls_lone_running_request_after_upstream_finishes(build_adapter, model_mode):
     """Regression test for vllm-project/vllm-omni#5349.
 
-    ``finished_requests`` means "upstream sent its terminal chunk" (see
-    ``is_done_receiving_chunks``), not "this stage's own generation is done".
-    A downstream stage (e.g. the talker) can still have a long autoregressive
-    decode ahead of it after its upstream (e.g. the thinker) has fully sent a
-    short response. The runtime path evicts on that upstream-finished signal
-    via ``postprocess_scheduler_output`` once the request has been scheduled
-    once more; ``_ensure_active_stream`` then permanently denies it
-    re-admission (the ``finished_requests`` check is checked before, and
-    independently of, the window-count check), even though nothing else is
-    competing for the freed slot. This wedges the request in
-    ``_preempt_non_active_running`` forever: it never gets scheduled again,
-    so its output silently stalls (observed on real hardware: 68k
-    DENY/HOLD/RESTORE_HELD cycles over a ~90s stall, zero errors, matches the
-    issue's "no error is raised anywhere" report).
+    upstream_finished_requests means the upstream sent its terminal chunk,
+    not that this stage's own generation is done. A downstream stage can
+    still have a long decode ahead after its upstream finishes. Evicting on
+    that signal and then permanently denying re-admission wedges the
+    request out of running_queue forever, with no error.
 
-    ``requests_with_ready_chunks`` is set up front so the request already has
-    a chunk to process this tick: ``_process_chunk_queue`` then leaves it
-    untouched in ``running_queue`` instead of legitimately parking it in
-    ``waiting_for_chunk_running_requests`` (a separate, correct "waiting for
-    real data" mechanism this test must not conflate with the bug). That lets
-    the final assertion check ``running_queue`` directly -- proof the request
-    is actually still schedulable, not just "not denied by one specific
-    mechanism".
+    requests_with_ready_chunks is set up front so the request stays in
+    running_queue this tick instead of legitimately parking in
+    waiting_for_chunk_running_requests (a separate mechanism this test must
+    not conflate with the bug).
 
-    Parametrized over both worker types: the real-world issue hit an "ar"
-    stage (Qwen3-Omni's Stage 1 talker), but the fix must not regress the
-    "generation" stage (Qwen3-TTS's Stage 1 Code2Wav) this feature was
-    designed and benchmarked for (RFC #3535 / PR #3592).
+    Parametrized over both worker types: the real issue hit an "ar" stage
+    (Qwen3-Omni's talker); must not regress "generation" (Qwen3-TTS's
+    Code2Wav), which this feature was designed for.
     """
     adapter, _ = build_adapter(stage_id=1, model_mode=model_mode, max_num_seqs=2, active_stream_window=2)
     running_req = _req("req-1", RequestStatus.RUNNING)
@@ -533,12 +513,8 @@ def test_active_stream_window_stalls_lone_running_request_after_upstream_finishe
     adapter._active_streams["req-1"] = running_req
     adapter.requests_with_ready_chunks.add("req-1")
 
-    # Upstream (e.g. thinker) has sent its terminal chunk; this stage is
-    # still decoding the SAME request -- it has not itself finished. Drive
-    # this through the real runtime trigger (postprocess_scheduler_output),
-    # not a private helper, so this test survives however eviction ends up
-    # implemented internally.
-    adapter.finished_requests.add("req-1")
+    # Upstream terminal chunk arrives; this stage hasn't finished.
+    adapter.upstream_finished_requests.add("req-1")
     scheduler_output = SimpleNamespace(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(req_ids=["req-1"]),
@@ -546,33 +522,21 @@ def test_active_stream_window_stalls_lone_running_request_after_upstream_finishe
     adapter.postprocess_scheduler_output(scheduler_output)
     assert not running_req.is_finished()  # sanity: not done
 
-    # Nothing else is competing for the slot (K=2, only 1 stream in flight),
-    # so req-1 should be re-admitted and keep decoding uninterrupted -- i.e.
-    # actually still be scheduled this tick.
+    # No competition for the slot; req-1 must stay schedulable.
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
-    assert running_queue == [running_req], (
-        "req-1 must still be schedulable this tick: nothing else needs the "
-        "slot and the request is still RUNNING, not finished. Losing it "
-        "from running_queue here is vllm-project/vllm-omni#5349 -- the "
-        "request gets held out forever and its output silently stalls."
-    )
+    assert running_queue == [running_req], "req-1 must still be schedulable -- losing it here is #5349"
     assert not adapter.waiting_for_chunk_running_requests
     assert running_req not in adapter._held_non_active
     assert list(adapter._active_streams) == ["req-1"]
 
 
-def test_finish_requests_releases_multiple_slots_in_sequence(build_adapter):
-    """Companion to test_fifo_promotion, which only finishes one of the two
-    initially-active requests. After EACH of the K active streams finishes
-    locally (not merely upstream-finished), promotion of a full new batch of
-    K waiting requests must still work -- the bounded-K window must not be
-    left permanently exhausted by stale entries after a K-sized batch of
-    ordinary completions cycles through (vllm-project/vllm-omni#5349 P1: this
-    is exactly the shape of leak a missing per-request release would cause,
-    just adapter-level here since the release trigger itself is
-    schedulerlevel -- see test_omni_ar_scheduler_free_request_cleanup.py for
-    the scheduler-level regression).
+def test_cleanup_receiver_releases_multiple_slots_in_sequence(build_adapter):
+    """Companion to test_fifo_promotion: after EACH of the K active streams
+    finishes (not just one), promotion of a new K-sized batch must still
+    work -- the window must not stay exhausted by stale entries. See
+    test_omni_ar_scheduler_free_request_cleanup.py for the scheduler-level
+    proof that ordinary completion calls cleanup_receiver().
     """
     adapter, _ = build_adapter(stage_id=1, model_mode="generation", max_num_seqs=2, active_stream_window=2)
     reqs = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(1, 5)]
@@ -582,14 +546,12 @@ def test_finish_requests_releases_multiple_slots_in_sequence(build_adapter):
     adapter.process_pending_chunks(waiting_queue, running_queue)
     assert list(adapter._active_streams) == ["req-1", "req-2"]
 
-    adapter.finish_requests(["req-1"], RequestStatus.FINISHED_STOPPED, requests={"req-1": reqs[0]})
-    adapter.finish_requests(["req-2"], RequestStatus.FINISHED_STOPPED, requests={"req-2": reqs[1]})
+    adapter.cleanup_receiver("req-1")
+    adapter.cleanup_receiver("req-2")
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
     assert list(adapter._active_streams) == ["req-3", "req-4"], (
-        "both freed slots must be reusable -- the window must not stay "
-        "exhausted by stale entries after a full K-sized batch of ordinary "
-        "completions"
+        "both freed slots must be reusable after ordinary completion"
     )
 
 
@@ -600,7 +562,7 @@ def test_finish_requests_releases_multiple_slots_in_sequence(build_adapter):
 
 def _populate_adapter_state(adapter, req_id="req-1", ext_id="ext-1"):
     """Fill every per-request structure so cleanup can be verified."""
-    adapter.finished_requests.add(req_id)
+    adapter.upstream_finished_requests.add(req_id)
     adapter._active_streams[req_id] = SimpleNamespace(request_id=req_id)
     adapter.get_req_chunk[req_id] = 3
     adapter.requests_with_ready_chunks.add(req_id)
@@ -621,7 +583,7 @@ def test_cleanup_clears_all_state(build_adapter):
 
     adapter.cleanup(req_id, ext_id)
 
-    assert req_id not in adapter.finished_requests
+    assert req_id not in adapter.upstream_finished_requests
     assert req_id not in adapter._active_streams
     assert req_id not in adapter.get_req_chunk
     assert req_id not in adapter.requests_with_ready_chunks
@@ -674,7 +636,7 @@ def test_cleanup_request_id_reuse_not_polluted(build_adapter):
 
     adapter.cleanup(req_id, ext_id)
 
-    assert req_id not in adapter.finished_requests
+    assert req_id not in adapter.upstream_finished_requests
     assert req_id not in adapter.get_req_chunk
 
 
@@ -700,7 +662,7 @@ def test_cleanup_only_affects_target_request(build_adapter):
 
     adapter.cleanup("req-a", "ext-a")
 
-    assert "req-b" in adapter.finished_requests
+    assert "req-b" in adapter.upstream_finished_requests
     assert "req-b" in adapter.get_req_chunk
     assert "ext-b" in adapter.put_req_chunk
     assert "ext-b" in adapter.request_payload
@@ -723,13 +685,13 @@ def test_cleanup_after_poll_flow(build_adapter):
     connector.get.return_value = (payload, 8)
     adapter._poll_single_request(request)
 
-    assert "req-flow" in adapter.finished_requests
+    assert "req-flow" in adapter.upstream_finished_requests
     assert adapter.get_req_chunk["req-flow"] == 1
     assert "req-flow" in adapter.request_ids_mapping
 
     adapter.cleanup("req-flow", "ext-flow")
 
-    assert "req-flow" not in adapter.finished_requests
+    assert "req-flow" not in adapter.upstream_finished_requests
     assert "req-flow" not in adapter.get_req_chunk
     assert "req-flow" not in adapter.request_ids_mapping
     assert "ext-flow" not in adapter.request_payload
@@ -763,7 +725,7 @@ def test_finish_requests_removes_zombies_from_chunk_waiting_deques(build_adapter
     adapter.waiting_for_chunk_waiting_requests = deque([zombie, other])
     adapter.waiting_for_chunk_running_requests = deque([other, zombie])
     adapter.requests_with_ready_chunks.add("req-zombie")
-    adapter.finished_requests.add("req-zombie")
+    adapter.upstream_finished_requests.add("req-zombie")
     requests_map = {
         "req-zombie": zombie,
         "req-live": other,
@@ -778,7 +740,7 @@ def test_finish_requests_removes_zombies_from_chunk_waiting_deques(build_adapter
     assert [req.request_id for req in adapter.waiting_for_chunk_waiting_requests] == ["req-live"]
     assert [req.request_id for req in adapter.waiting_for_chunk_running_requests] == ["req-live"]
     assert "req-zombie" not in adapter.requests_with_ready_chunks
-    assert "req-zombie" not in adapter.finished_requests
+    assert "req-zombie" not in adapter.upstream_finished_requests
 
 
 def test_finish_requests_releases_active_stream_slot(build_adapter):
@@ -844,7 +806,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
     cleanup_calls = []
 
     adapter_mock = mocker.MagicMock()
-    adapter_mock.finished_requests = {"req-s1"}
+    adapter_mock.upstream_finished_requests = {"req-s1"}
     adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
 
     from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -1080,7 +1042,7 @@ def test_wire_round_trip_struct_to_dict_contract():
 def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
     """Build a mock scheduler with requests queued for deferred finish."""
     adapter_mock = mocker.MagicMock()
-    adapter_mock.finished_requests = {r.request_id for r in pending_finish_reqs}
+    adapter_mock.upstream_finished_requests = {r.request_id for r in pending_finish_reqs}
     cleanup_calls = []
     adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
 

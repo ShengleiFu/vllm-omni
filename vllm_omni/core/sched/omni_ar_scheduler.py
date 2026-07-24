@@ -813,14 +813,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return kv_xfer_params
         finally:
             self._free_input_coordinator_request(request_id)
-            # Normal EOS completion runs through this method, not
-            # finish_requests() (that is the external abort/cancel entry
-            # point -- see its docstring). Without this, a request that
-            # finishes normally never leaves chunk_transfer_adapter's
-            # _active_streams, so the bounded-K active-stream window
-            # (active_stream_window > 0) permanently fills up with stale
-            # entries after K normal completions. See
-            # vllm-project/vllm-omni#5349.
+            # Normal completion runs through here, not finish_requests()
+            # (the abort path) -- see vllm-project/vllm-omni#5349.
             if self.chunk_transfer_adapter is not None:
                 self.chunk_transfer_adapter.cleanup_receiver(request_id)
 
