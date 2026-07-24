@@ -384,10 +384,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
-        if request_id in self.finished_requests:
-            self._evict_finished_active_streams({request_id})
-        else:
-            self._active_streams.pop(request_id, None)
+        self._active_streams.pop(request_id, None)
         self.finished_requests.discard(request_id)
         self.segment_finished_requests.discard(request_id)
         self.get_req_chunk.pop(request_id, None)
@@ -502,13 +499,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._promote_active_streams(waiting_queue)
         self._preempt_non_active_running(waiting_queue, running_queue)
 
-    def _evict_finished_active_streams(self, request_ids: set[str] | None = None) -> None:
-        for request_id in list(self._active_streams):
-            if request_ids is not None and request_id not in request_ids:
-                continue
-            if request_id in self.finished_requests:
-                self._active_streams.pop(request_id, None)
-
     def _promote_active_streams(self, queue: Any) -> None:
         if len(self._active_streams) >= self._active_window:
             return
@@ -516,7 +506,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if len(self._active_streams) >= self._active_window:
                 return
             request_id = request.request_id
-            if request_id in self._active_streams or request_id in self.finished_requests:
+            if request_id in self._active_streams:
                 continue
             # Iterating the existing queue preserves FIFO admission.
             self._active_streams[request_id] = request
@@ -528,7 +518,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if request_id in self._active_streams:
             self._active_streams[request_id] = request
             return True
-        if request_id in self.finished_requests or len(self._active_streams) >= self._active_window:
+        if len(self._active_streams) >= self._active_window:
             return False
         self._active_streams[request_id] = request
         return True
@@ -666,25 +656,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if requests is not None:
             self.attach_cached_additional_information(scheduler_output, requests)
-        scheduled_req_ids = self._scheduled_request_ids(scheduler_output)
         self._clear_chunk_ready(scheduler_output)
-        if scheduled_req_ids:
-            # Terminal chunks must stay active until they are scheduled once.
-            self._evict_finished_active_streams(scheduled_req_ids)
-
-    @staticmethod
-    def _scheduled_request_ids(scheduler_output: Any) -> set[str]:
-        req_ids: set[str] = set()
-        if scheduler_output.scheduled_new_reqs:
-            for req_data in scheduler_output.scheduled_new_reqs:
-                req_id = getattr(req_data, "req_id", None)
-                if req_id:
-                    req_ids.add(req_id)
-        if scheduler_output.scheduled_cached_reqs:
-            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
-                if req_id:
-                    req_ids.add(req_id)
-        return req_ids
 
     @staticmethod
     def attach_cached_additional_information(scheduler_output: Any, requests: dict[str, Request]) -> None:

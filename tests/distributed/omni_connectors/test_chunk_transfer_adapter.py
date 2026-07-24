@@ -403,7 +403,7 @@ def test_process_and_restore_queues(build_adapter):
 
 
 def test_fifo_promotion(build_adapter):
-    adapter, _ = build_adapter(stage_id=1, max_num_seqs=2, active_stream_window=2)
+    adapter, _ = build_adapter(stage_id=1, model_mode="generation", max_num_seqs=2, active_stream_window=2)
     reqs = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(1, 5)]
     waiting_queue = DummyWaitingQueue(reqs)
     running_queue = []
@@ -416,11 +416,15 @@ def test_fifo_promotion(build_adapter):
     assert reqs[1].status == RequestStatus.WAITING_FOR_CHUNK
     assert reqs[2].status == RequestStatus.WAITING
 
-    adapter.finished_requests.add("req-1")
-    # Eviction is deferred to postprocess_scheduler_output in the runtime path
-    # (commit c4d95fd9 — otherwise the terminal chunk deadlocks at c=8 K=2).
-    # Simulate it here so promotion can pick up the freed slot.
-    adapter._evict_finished_active_streams({"req-1"})
+    # req-1 truly finishes -- this is the real production trigger (the
+    # vLLM scheduler calling finish_requests() once req-1 reaches a terminal
+    # status), which already frees its active-stream slot via the
+    # self._active_streams.pop() in finish_requests(). This replaces the old
+    # "adapter.finished_requests.add(...) + _evict_finished_active_streams(...)"
+    # simulation of "upstream sent its last chunk" -- see
+    # vllm-project/vllm-omni#5349 for why that signal must not be conflated
+    # with "this stage's own generation for req-1 is done".
+    adapter.finish_requests(["req-1"], RequestStatus.FINISHED_STOPPED, requests={"req-1": reqs[0]})
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
     assert list(adapter._active_streams) == ["req-2", "req-3"]
@@ -449,7 +453,7 @@ def test_legacy_k0(build_adapter):
 
 
 def test_finished_releases_slot(build_adapter):
-    adapter, _ = build_adapter(stage_id=1, max_num_seqs=1, active_stream_window=1)
+    adapter, _ = build_adapter(stage_id=1, model_mode="generation", max_num_seqs=1, active_stream_window=1)
     req_1 = _req("req-1", RequestStatus.WAITING)
     req_2 = _req("req-2", RequestStatus.WAITING)
     waiting_queue = DummyWaitingQueue([req_1, req_2])
@@ -459,10 +463,9 @@ def test_finished_releases_slot(build_adapter):
     assert list(adapter._active_streams) == ["req-1"]
     assert waiting_queue == [req_2]
 
-    adapter.finished_requests.add("req-1")
-    # Eviction is deferred to postprocess_scheduler_output in the runtime path
-    # (commit c4d95fd9). Simulate it so promotion can pick up the freed slot.
-    adapter._evict_finished_active_streams({"req-1"})
+    # req-1 truly finishes (see test_fifo_promotion for why this replaces the
+    # old finished_requests + _evict_finished_active_streams simulation).
+    adapter.finish_requests(["req-1"], RequestStatus.FINISHED_STOPPED, requests={"req-1": req_1})
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
     assert list(adapter._active_streams) == ["req-2"]
@@ -487,6 +490,70 @@ def test_postprocess_scheduler_output(build_adapter):
     assert cached_info["cached-ready"] == {"k": "v"}
     assert cached_info["missing"] is None
     assert adapter.requests_with_ready_chunks == {"leftover"}
+
+
+@pytest.mark.parametrize("model_mode", ["ar", "generation"])
+def test_active_stream_window_stalls_lone_running_request_after_upstream_finishes(build_adapter, model_mode):
+    """Regression test for vllm-project/vllm-omni#5349.
+
+    ``finished_requests`` means "upstream sent its terminal chunk" (see
+    ``is_done_receiving_chunks``), not "this stage's own generation is done".
+    A downstream stage (e.g. the talker) can still have a long autoregressive
+    decode ahead of it after its upstream (e.g. the thinker) has fully sent a
+    short response. The runtime path evicts on that upstream-finished signal
+    via ``postprocess_scheduler_output`` once the request has been scheduled
+    once more; ``_ensure_active_stream`` then permanently denies it
+    re-admission (the ``finished_requests`` check is checked before, and
+    independently of, the window-count check), even though nothing else is
+    competing for the freed slot. This wedges the request in
+    ``_preempt_non_active_running`` forever: it never gets scheduled again,
+    so its output silently stalls (observed on real hardware: 68k
+    DENY/HOLD/RESTORE_HELD cycles over a ~90s stall, zero errors, matches the
+    issue's "no error is raised anywhere" report).
+
+    Parametrized over both worker types: the real-world issue hit an "ar"
+    stage (Qwen3-Omni's Stage 1 talker), but the fix must not regress the
+    "generation" stage (Qwen3-TTS's Stage 1 Code2Wav) this feature was
+    designed and benchmarked for (RFC #3535 / PR #3592).
+    """
+    adapter, _ = build_adapter(stage_id=1, model_mode=model_mode, max_num_seqs=2, active_stream_window=2)
+    running_req = _req("req-1", RequestStatus.RUNNING)
+    running_queue = [running_req]
+    waiting_queue = DummyWaitingQueue([])
+
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+    adapter.restore_queues(waiting_queue, running_queue)
+    assert list(adapter._active_streams) == ["req-1"]
+    assert running_queue == [running_req]
+
+    # Upstream (e.g. thinker) has sent its terminal chunk; this stage is
+    # still decoding the SAME request -- it has not itself finished. Drive
+    # this through the real runtime trigger (postprocess_scheduler_output),
+    # not a private helper, so this test survives however eviction ends up
+    # implemented internally.
+    adapter.finished_requests.add("req-1")
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=["req-1"]),
+    )
+    adapter.postprocess_scheduler_output(scheduler_output)
+    assert not running_req.is_finished()  # sanity: not done
+
+    # Nothing else is competing for the slot (K=2, only 1 stream in flight),
+    # so req-1 should be re-admitted and keep decoding uninterrupted.
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert list(adapter._active_streams) == ["req-1"], (
+        "req-1 should be re-admitted: nothing else needs the slot and the "
+        "request is still RUNNING, not finished. Denying it here is "
+        "vllm-project/vllm-omni#5349 -- the request gets held out of "
+        "running_queue forever and its output silently stalls."
+    )
+    assert running_req not in adapter._held_non_active, (
+        "req-1 must not be preempted into _held_non_active -- that is the "
+        "mechanism that keeps it out of running_queue on every subsequent "
+        "scheduler tick, i.e. the permanent stall."
+    )
 
 
 # ---------------------------------------------------------------
