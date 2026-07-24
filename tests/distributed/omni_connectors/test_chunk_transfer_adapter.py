@@ -511,6 +511,15 @@ def test_active_stream_window_stalls_lone_running_request_after_upstream_finishe
     DENY/HOLD/RESTORE_HELD cycles over a ~90s stall, zero errors, matches the
     issue's "no error is raised anywhere" report).
 
+    ``requests_with_ready_chunks`` is set up front so the request already has
+    a chunk to process this tick: ``_process_chunk_queue`` then leaves it
+    untouched in ``running_queue`` instead of legitimately parking it in
+    ``waiting_for_chunk_running_requests`` (a separate, correct "waiting for
+    real data" mechanism this test must not conflate with the bug). That lets
+    the final assertion check ``running_queue`` directly -- proof the request
+    is actually still schedulable, not just "not denied by one specific
+    mechanism".
+
     Parametrized over both worker types: the real-world issue hit an "ar"
     stage (Qwen3-Omni's Stage 1 talker), but the fix must not regress the
     "generation" stage (Qwen3-TTS's Stage 1 Code2Wav) this feature was
@@ -521,10 +530,8 @@ def test_active_stream_window_stalls_lone_running_request_after_upstream_finishe
     running_queue = [running_req]
     waiting_queue = DummyWaitingQueue([])
 
-    adapter.process_pending_chunks(waiting_queue, running_queue)
-    adapter.restore_queues(waiting_queue, running_queue)
-    assert list(adapter._active_streams) == ["req-1"]
-    assert running_queue == [running_req]
+    adapter._active_streams["req-1"] = running_req
+    adapter.requests_with_ready_chunks.add("req-1")
 
     # Upstream (e.g. thinker) has sent its terminal chunk; this stage is
     # still decoding the SAME request -- it has not itself finished. Drive
@@ -540,19 +547,49 @@ def test_active_stream_window_stalls_lone_running_request_after_upstream_finishe
     assert not running_req.is_finished()  # sanity: not done
 
     # Nothing else is competing for the slot (K=2, only 1 stream in flight),
-    # so req-1 should be re-admitted and keep decoding uninterrupted.
+    # so req-1 should be re-admitted and keep decoding uninterrupted -- i.e.
+    # actually still be scheduled this tick.
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
-    assert list(adapter._active_streams) == ["req-1"], (
-        "req-1 should be re-admitted: nothing else needs the slot and the "
-        "request is still RUNNING, not finished. Denying it here is "
-        "vllm-project/vllm-omni#5349 -- the request gets held out of "
-        "running_queue forever and its output silently stalls."
+    assert running_queue == [running_req], (
+        "req-1 must still be schedulable this tick: nothing else needs the "
+        "slot and the request is still RUNNING, not finished. Losing it "
+        "from running_queue here is vllm-project/vllm-omni#5349 -- the "
+        "request gets held out forever and its output silently stalls."
     )
-    assert running_req not in adapter._held_non_active, (
-        "req-1 must not be preempted into _held_non_active -- that is the "
-        "mechanism that keeps it out of running_queue on every subsequent "
-        "scheduler tick, i.e. the permanent stall."
+    assert not adapter.waiting_for_chunk_running_requests
+    assert running_req not in adapter._held_non_active
+    assert list(adapter._active_streams) == ["req-1"]
+
+
+def test_finish_requests_releases_multiple_slots_in_sequence(build_adapter):
+    """Companion to test_fifo_promotion, which only finishes one of the two
+    initially-active requests. After EACH of the K active streams finishes
+    locally (not merely upstream-finished), promotion of a full new batch of
+    K waiting requests must still work -- the bounded-K window must not be
+    left permanently exhausted by stale entries after a K-sized batch of
+    ordinary completions cycles through (vllm-project/vllm-omni#5349 P1: this
+    is exactly the shape of leak a missing per-request release would cause,
+    just adapter-level here since the release trigger itself is
+    schedulerlevel -- see test_omni_ar_scheduler_free_request_cleanup.py for
+    the scheduler-level regression).
+    """
+    adapter, _ = build_adapter(stage_id=1, model_mode="generation", max_num_seqs=2, active_stream_window=2)
+    reqs = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(1, 5)]
+    waiting_queue = DummyWaitingQueue(reqs)
+    running_queue = []
+
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+    assert list(adapter._active_streams) == ["req-1", "req-2"]
+
+    adapter.finish_requests(["req-1"], RequestStatus.FINISHED_STOPPED, requests={"req-1": reqs[0]})
+    adapter.finish_requests(["req-2"], RequestStatus.FINISHED_STOPPED, requests={"req-2": reqs[1]})
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert list(adapter._active_streams) == ["req-3", "req-4"], (
+        "both freed slots must be reusable -- the window must not stay "
+        "exhausted by stale entries after a full K-sized batch of ordinary "
+        "completions"
     )
 
 
