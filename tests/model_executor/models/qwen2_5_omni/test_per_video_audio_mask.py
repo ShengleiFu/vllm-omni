@@ -13,6 +13,7 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerMultiModalProcessor,
     _coerce_use_audio_in_video_for_hf_processor,
     _filter_video_use_audio_in_video_for_uncached_items,
+    _get_video_second_per_grid_t,
     _normalize_use_audio_in_video,
 )
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
@@ -191,6 +192,31 @@ def test_coerce_use_audio_in_video_for_hf_processor_does_not_validate_against_pa
 
     assert result["use_audio_in_video"] is False
     assert result[_PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY] == [True, False]
+
+
+def test_get_video_second_per_grid_t_reads_the_omni_processor_key():
+    """Regression test for vllm-project/vllm-omni#5355.
+
+    The HF Qwen2.5-Omni / Qwen3-Omni-MoE processors compute the correct
+    per-video time step from the real sampled fps and return it as
+    ``video_second_per_grid`` (see processing_qwen3_omni_moe.py /
+    processing_qwen2_5_omni.py __call__: they set
+    ``videos_inputs["video_second_per_grid"] = temporal_patch_size / fps``
+    and merge ``videos_inputs`` into the returned BatchFeature). That is a
+    different key than ``second_per_grid_ts``, which is what the non-omni
+    Qwen2_5VLProcessor uses instead (processing_qwen2_5_vl.py). This helper
+    only checked ``second_per_grid_ts``, so for the omni models it always
+    missed the real value already sitting in ``out_mm_data`` and fell back
+    to ``default``.
+    """
+    second_per_grid_t = _get_video_second_per_grid_t(
+        out_mm_data={"video_second_per_grid": [1.0019083969465647]},
+        hf_processor_mm_kwargs={},
+        item_idx=0,
+        default=2.0,
+    )
+
+    assert second_per_grid_t == pytest.approx(1.0019083969465647)
 
 
 def test_filter_video_use_audio_in_video_for_uncached_items_aligns_partial_cache_mask():
