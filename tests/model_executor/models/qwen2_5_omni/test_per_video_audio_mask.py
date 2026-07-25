@@ -374,7 +374,9 @@ def test_qwen2_5_prompt_updates_apply_audio_mask_per_video():
     assert video_update.resolve(1).content.full == [VIDEO_TOKEN_ID, VIDEO_TOKEN_ID]
 
 
-def test_qwen2_5_prompt_updates_prefer_hf_second_per_grid_ts_from_outputs():
+def test_qwen2_5_prompt_updates_prefer_hf_video_second_per_grid_from_outputs():
+    """The omni processor output (video_second_per_grid) takes priority
+    over a client-supplied second_per_grid_ts override."""
     captured = {}
     fake_self = _fake_qwen2_prompt_processor()
 
@@ -387,7 +389,7 @@ def test_qwen2_5_prompt_updates_prefer_hf_second_per_grid_ts_from_outputs():
         get_data=lambda **_kwargs: {
             "audio_feature_lengths": torch.tensor([100]),
             "video_grid_thw": torch.tensor([[1, 1, 1]]),
-            "second_per_grid_ts": torch.tensor([0.25]),
+            "video_second_per_grid": torch.tensor([0.25]),
         }
     )
     mm_items = SimpleNamespace(
@@ -534,7 +536,9 @@ def test_qwen3_processor_inherits_vllm_omni_per_video_helpers():
     )
 
 
-def test_qwen3_prompt_updates_prefer_hf_second_per_grid_ts_from_outputs():
+def test_qwen3_prompt_updates_prefer_hf_video_second_per_grid_from_outputs():
+    """The omni processor output (video_second_per_grid) takes priority
+    over a client-supplied second_per_grid_ts override."""
     captured = {}
     fake_self = _fake_qwen3_prompt_processor()
 
@@ -547,7 +551,7 @@ def test_qwen3_prompt_updates_prefer_hf_second_per_grid_ts_from_outputs():
         get_data=lambda **_kwargs: {
             "audio_feature_lengths": torch.tensor([100]),
             "video_grid_thw": torch.tensor([[1, 1, 1]]),
-            "second_per_grid_ts": torch.tensor([0.25]),
+            "video_second_per_grid": torch.tensor([0.25]),
         }
     )
     mm_items = SimpleNamespace(

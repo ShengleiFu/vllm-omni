@@ -176,8 +176,6 @@ def _get_video_second_per_grid_t(
 ) -> float:
     second_per_grid_ts = out_mm_data.get("video_second_per_grid")
     if second_per_grid_ts is None:
-        second_per_grid_ts = out_mm_data.get("second_per_grid_ts")
-    if second_per_grid_ts is None:
         second_per_grid_ts = hf_processor_mm_kwargs.get("second_per_grid_ts", None)
     if second_per_grid_ts is None:
         return default
