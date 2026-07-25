@@ -384,11 +384,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             stopped = False
             is_segment_finished = False
-            # Only set inside the `if stopped:` branch below; give it the
-            # same safe default as its neighbors above, otherwise the
-            # chunk_transfer_adapter gate further down raises
-            # UnboundLocalError on any non-terminal step. See
-            # vllm-project/vllm-omni#5399.
             finished = False
             new_logprobs = None
             new_token_ids = generated_token_ids
