@@ -179,6 +179,47 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
 
 
+def test_non_stopping_step_with_chunk_transfer_adapter_does_not_crash() -> None:
+    """Regression test for vllm-project/vllm-omni#5399.
+
+    #5383 added ``finished`` as a third disjunct to the
+    chunk_transfer_adapter save_async gate, but ``finished`` is only ever
+    assigned inside the ``if stopped:`` branch -- unlike its neighbors
+    ``stopped``/``is_segment_finished``, which both get a safe top-of-loop
+    default. Any ordinary (non-terminal) decode step with a
+    chunk_transfer_adapter configured and no inter_stage_output this step
+    raised UnboundLocalError instead of treating ``finished`` as False,
+    killing the whole EngineCore.
+    """
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+
+    sched = MagicMock()
+    sched.requests = {session.request_id: session}
+    sched.perf_metrics = None
+    sched.structured_output_manager.should_advance.return_value = False
+    sched._process_kv_transfer_trigger.return_value = False
+    sched.chunk_transfer_adapter = SimpleNamespace()  # configured, i.e. not None
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {session.request_id: 1}
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [[]]  # no tokens generated this step
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {session.request_id: 0}
+    model_runner_output.routed_experts = None
+
+    OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+
+
 def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
     sched = _make_scheduler(stage_id=1)
     sched.chunk_transfer_adapter = SimpleNamespace(
