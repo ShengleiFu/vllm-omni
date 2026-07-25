@@ -1590,13 +1590,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             elif modality == "video":
                 t, h, w = mm_feature.data["video_grid_thw"].data.tolist()
                 second_per_grid_ts = 2.0
-                # See _get_video_second_per_grid_t: the omni HF processor
-                # returns this as "video_second_per_grid", not
-                # "second_per_grid_ts". vllm-project/vllm-omni#5355.
                 if mm_feature.data.get("video_second_per_grid"):
                     second_per_grid_ts = mm_feature.data["video_second_per_grid"].data.item()
-                elif mm_feature.data.get("second_per_grid_ts"):
-                    second_per_grid_ts = mm_feature.data["second_per_grid_ts"].data.item()
                 use_audio_in_video = bool(
                     mm_feature.data.get("use_audio_in_video") and mm_feature.data["use_audio_in_video"].data.item()
                 )

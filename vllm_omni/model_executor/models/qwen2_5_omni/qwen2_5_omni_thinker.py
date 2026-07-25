@@ -174,12 +174,6 @@ def _get_video_second_per_grid_t(
     item_idx: int,
     default: float,
 ) -> float:
-    # The omni HF processors (Qwen2.5-Omni, Qwen3-Omni-MoE) compute this from
-    # the real sampled fps and return it as "video_second_per_grid" -- a
-    # different key than the non-omni Qwen2_5VLProcessor's
-    # "second_per_grid_ts". Check the omni key first; the legacy key and the
-    # client-supplied kwarg remain as fallbacks. See
-    # vllm-project/vllm-omni#5355.
     second_per_grid_ts = out_mm_data.get("video_second_per_grid")
     if second_per_grid_ts is None:
         second_per_grid_ts = out_mm_data.get("second_per_grid_ts")
@@ -1073,13 +1067,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
             elif modality == "video":
                 t, h, w = mm_feature.data["video_grid_thw"].data.tolist()
                 second_per_grid_ts = 1.0
-                # See _get_video_second_per_grid_t: the omni HF processor
-                # returns this as "video_second_per_grid", not
-                # "second_per_grid_ts". vllm-project/vllm-omni#5355.
                 if mm_feature.data.get("video_second_per_grid"):
                     second_per_grid_ts = mm_feature.data["video_second_per_grid"].data.item()
-                elif mm_feature.data.get("second_per_grid_ts"):
-                    second_per_grid_ts = mm_feature.data["second_per_grid_ts"].data.item()
                 use_audio_in_video = False
                 if mm_feature.data.get("use_audio_in_video"):
                     use_audio_in_video = bool(mm_feature.data["use_audio_in_video"].data.item())
