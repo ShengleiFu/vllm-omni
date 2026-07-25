@@ -26,7 +26,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
+from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import (
@@ -44,6 +44,12 @@ if TYPE_CHECKING:
     from vllm.tokenizers import TokenizerLike
     from vllm.v1.engine import PauseMode
 
+    from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
+    from vllm_omni.experimental.fullduplex.engine.messages import (
+        DuplexFence,
+        DuplexSessionLifecycleMessage,
+    )
+    from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
     from vllm_omni.inputs.data import OmniPromptType
 
 logger = init_logger(__name__)
@@ -141,12 +147,18 @@ class AsyncOmni(EngineClient, OmniBase):
         OmniBase.__init__(self, model=model, **kwargs)
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
-        self._is_sleeping: bool = False
+        self._sleeping_tags: set[str] = set()
+        self._level2_sleeping: bool = False
+        self._duplex_request_client: DuplexRequestClient | None = None
+        self.duplex_lifecycle_events: asyncio.Queue[DuplexSessionLifecycleMessage] = asyncio.Queue()
         self.final_output_task: asyncio.Task | None = None
         self.event_resolver = AsyncEventResolver(orchestrator=self)
         self.config_path = self.engine.config_path
         self.tts_max_instructions_length = kwargs.get("tts_max_instructions_length", None)
         self.input_processor = self.engine.input_processor
+        self.endpoint_restrictions = self.engine.endpoint_restrictions
+        self.duplex_session_config = self.engine.duplex_session_config
+        self.duplex_serving_adapter_path = self.engine.duplex_serving_adapter_path
 
         stage_index = self._get_comprehension_stage_index()
         if stage_index is None:
@@ -208,9 +220,12 @@ class AsyncOmni(EngineClient, OmniBase):
 
     def get_diffusion_od_config(self) -> Any | None:
         """Return the diffusion-stage config when the pipeline has one."""
+        saw_diffusion_stage = False
         for stage_client in self.engine.stage_clients:
             if getattr(stage_client, "stage_type", None) != "diffusion":
                 continue
+
+            saw_diffusion_stage = True
 
             od_config = getattr(stage_client, "od_config", None)
             if od_config is not None:
@@ -220,6 +235,11 @@ class AsyncOmni(EngineClient, OmniBase):
             od_config = getattr(inner_engine, "od_config", None)
             if od_config is not None:
                 return od_config
+
+        # Out-of-process diffusion clients don't carry od_config (it lives in the
+        # worker); fall back to the engine's model_class_name resolution.
+        if saw_diffusion_stage:
+            return self.engine.get_diffusion_od_config()
 
         return None
 
@@ -243,6 +263,191 @@ class AsyncOmni(EngineClient, OmniBase):
         uuid = random_uuid()
         prefix = "" if not external_request_id else f"{external_request_id}-"
         return f"{prefix}{uuid:.8}"
+
+    async def open_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        session_mode: str = "duplex",
+        capabilities: dict[str, object] | None = None,
+        session_config: dict[str, object] | None = None,
+        runtime_config: dict[str, object] | None = None,
+        fence: DuplexFence,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Open an engine-level duplex session when the backend supports it."""
+        return await self._get_duplex_request_client().open(
+            session_id,
+            session_mode=session_mode,
+            capabilities=capabilities,
+            session_config=session_config,
+            runtime_config=runtime_config,
+            fence=fence,
+            timeout=timeout,
+        )
+
+    async def append_duplex_input_async(
+        self,
+        session_id: str,
+        *,
+        mode: str,
+        payload: object,
+        operation_id: str | None = None,
+        final: bool = False,
+        expected_epoch: int | None = None,
+        fence: DuplexFence,
+        timeout: float | None = 10.0,
+        collect_outputs: bool = True,
+    ) -> dict[str, object]:
+        """Append input to an engine-level duplex session."""
+        return await self._get_duplex_request_client().append(
+            session_id,
+            mode=mode,
+            payload=payload,
+            operation_id=operation_id,
+            final=final,
+            expected_epoch=expected_epoch,
+            fence=fence,
+            timeout=timeout,
+            collect_outputs=collect_outputs,
+        )
+
+    async def collect_duplex_data_plane_outputs_async(
+        self,
+        request_id: str,
+        *,
+        response_stage_id: int | None = None,
+        timeout: float | None = 10.0,
+    ) -> list[OmniRequestOutput]:
+        """Collect the next duplex data-plane output batch for a live request."""
+        return await self._get_duplex_request_client().collect_registered_outputs(
+            request_id,
+            response_stage_id=response_stage_id,
+            timeout=timeout,
+        )
+
+    async def signal_duplex_turn_async(
+        self,
+        session_id: str,
+        *,
+        event: str,
+        fence: DuplexFence,
+        next_fence: DuplexFence | None = None,
+        session_config: dict[str, object] | None = None,
+        runtime_config: dict[str, object] | None = None,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Send a turn/control signal to an engine-level duplex session."""
+        return await self._get_duplex_request_client().signal(
+            session_id,
+            event=event,
+            fence=fence,
+            next_fence=next_fence,
+            session_config=session_config,
+            runtime_config=runtime_config,
+            timeout=timeout,
+        )
+
+    async def close_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        reason: str = "client_close",
+        fence: DuplexFence,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Close an engine-level duplex session."""
+        return await self._get_duplex_request_client().close(
+            session_id,
+            reason=reason,
+            fence=fence,
+            timeout=timeout,
+        )
+
+    async def touch_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        fence: DuplexFence,
+        activity: DuplexLeaseActivity,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        return await self._get_duplex_request_client().touch(
+            session_id,
+            fence=fence,
+            activity=activity,
+            timeout=timeout,
+        )
+
+    async def resume_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        fence: DuplexFence,
+        expected_lease_generation: int,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        return await self._get_duplex_request_client().resume(
+            session_id,
+            fence=fence,
+            expected_lease_generation=expected_lease_generation,
+            timeout=timeout,
+        )
+
+    def _get_duplex_request_client(self) -> DuplexRequestClient:
+        from vllm_omni.experimental.fullduplex.request_client import (
+            DuplexRequestClient,
+            DuplexRequestOutputPort,
+        )
+
+        client = getattr(self, "_duplex_request_client", None)
+        if client is None:
+            engine = getattr(self, "engine", None)
+            client = DuplexRequestClient(
+                engine,
+                DuplexRequestOutputPort(
+                    request_states=getattr(self, "request_states", {}),
+                    num_stages=getattr(engine, "num_stages", 1),
+                    log_stats=getattr(self, "log_stats", False),
+                    start_output_handler=self._final_output_handler,
+                    process_single_result=self._process_single_result,
+                ),
+            )
+            self._duplex_request_client = client
+        return client
+
+    @staticmethod
+    def _duplex_data_plane_request_info(result: dict[str, object]) -> tuple[str | None, int | None]:
+        from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
+
+        return DuplexRequestClient.request_info(result)
+
+    async def _collect_duplex_data_plane_outputs(
+        self,
+        request_id: str,
+        req_state: ClientRequestState,
+        *,
+        response_stage_id: int | None,
+        timeout: float | None,
+    ) -> list[OmniRequestOutput]:
+        return await self._get_duplex_request_client().collect_outputs(
+            request_id,
+            req_state,
+            response_stage_id=response_stage_id,
+            timeout=timeout,
+        )
+
+    @classmethod
+    def _is_direct_duplex_data_plane_response(cls, output: object) -> bool:
+        from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
+
+        return DuplexRequestClient.is_direct_response(output)
+
+    @classmethod
+    def _duplex_multimodal_output(cls, output: object) -> dict[str, object]:
+        from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
+
+        return DuplexRequestClient.multimodal_output(output)
 
     # ==================== Generate Method ====================
 
@@ -305,6 +510,14 @@ class AsyncOmni(EngineClient, OmniBase):
             await self._pause_cond.wait_for(lambda: not self._paused)
 
         logger.debug(f"[AsyncOmni] generate() called for request {external_request_id}")
+
+        _sleeping_tags = getattr(self, "_sleeping_tags", None)
+        if _sleeping_tags:
+            raise RuntimeError(
+                f"Generation rejected: Engine is partially or fully asleep. "
+                f"Currently sleeping tags: {list(_sleeping_tags)}. "
+                f"Please perform a full wake_up before generating."
+            )
 
         # Reject diffusion list-prompt early with a clear API error.
         if isinstance(prompt, list) and any(
@@ -675,6 +888,10 @@ class AsyncOmni(EngineClient, OmniBase):
                         await self.event_resolver.resolve(msg)
                         continue
 
+                    if getattr(msg, "type", None) == "duplex_session_lifecycle":
+                        await self.duplex_lifecycle_events.put(msg)
+                        continue
+
                     if isinstance(msg, ErrorMessage):
                         # Route request-scoped errors to that request's queue and
                         # keep the loop alive. A request whose stage replica died
@@ -932,11 +1149,32 @@ class AsyncOmni(EngineClient, OmniBase):
                 if ack is not None:
                     await self.event_resolver.resolve(ack)
                     final_acks.append(ack)
-        self._is_sleeping = True
+        if not hasattr(self, "_sleeping_tags"):
+            self._sleeping_tags = set()
+        self._sleeping_tags.update([CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value])
+        if level == 2:
+            self._level2_sleeping = True
         return final_acks
 
     async def wake_up(self, stage_ids: list[int] | None = None, tags: list[str] | None = None) -> list[OmniACK]:
         self._final_output_handler()
+
+        if getattr(self, "_level2_sleeping", False):
+            raise NotImplementedError(
+                "wake_up() after sleep(level=2) is not yet implemented: weights were "
+                "discarded from GPU and reloading from disk is not yet supported. "
+                "Use sleep(level=1) instead, which offloads weights to CPU RAM "
+                "and supports fast DMA restore."
+            )
+        _current_tags = getattr(self, "_sleeping_tags", set())
+        if tags is None:
+            requested_tags = list(_current_tags)
+        else:
+            requested_tags = [t for t in tags if t in _current_tags]
+        if not requested_tags:
+            logger.info(f"[{self._name}] Requested tags {tags} are already warm. Skipping wake_up.")
+            return []
+
         if stage_ids is None:
             stage_ids = list(range(len(self.engine.stage_clients)))
         total_workers = 0
@@ -950,7 +1188,7 @@ class AsyncOmni(EngineClient, OmniBase):
         task_id = str(uuid.uuid4())
         self.event_resolver.watch_task(task_id, expected_count=total_workers)
         logger.info(f"[{self._name}] Wake-up initiated (Task: {task_id}). Awaiting {total_workers} ACKs...")
-        task = OmniWakeTask(tags=tags, task_id=task_id)
+        task = OmniWakeTask(tags=requested_tags, task_id=task_id)
         rpc_results = await self.collective_rpc(method="handle_wake_task", args=(task,), stage_ids=stage_ids)
         final_acks = []
         for stage_res in rpc_results:
@@ -961,7 +1199,14 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_acks.append(ack)
         current_omni_platform.synchronize()
         await asyncio.sleep(0.1)
-        self._is_sleeping = False
+
+        for t in requested_tags:
+            if hasattr(self, "_sleeping_tags"):
+                self._sleeping_tags.discard(t)
+        # Only clear the level-2 flag once all tags are warm, in case partial
+        # wake support (e.g. tags=["kv_cache"] only) is added in the future.
+        if not getattr(self, "_sleeping_tags", None):
+            self._level2_sleeping = False
         logger.info(f"[{self._name}] All {len(final_acks)}/{total_workers} workers reported WARM for task {task_id}.")
         return final_acks
 
@@ -971,7 +1216,7 @@ class AsyncOmni(EngineClient, OmniBase):
         TODO(AsyncOmni): query the orchestrator once all stage backends expose
         a real sleeping-state RPC. For now we track the requested state locally.
         """
-        return self._is_sleeping
+        return bool(getattr(self, "_sleeping_tags", None))
 
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into all stages.
