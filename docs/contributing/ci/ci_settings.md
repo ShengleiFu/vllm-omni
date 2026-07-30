@@ -327,6 +327,65 @@ On PR builds, `upload_pipeline.py` logs `skip '…' (no changes under …)` for 
 - Use **groups** for dashboard readability; keep **E2E Test** as the group name CUDA diff filtering expects for `--e2e` nightly runs on main.
 - Prefix labels by model domain: **Omni ·**, **TTS ·**, **Diffusion ·**, **Simple ·**, etc., matching existing steps.
 
+### Per-model coverage
+
+Pilot (v1): two Merge-tier (L3) jobs in `.buildkite/cuda/test-merge.yml` upload
+per-model, per-entry-mode coverage as Buildkite artifacts — "Diffusion · Bagel
+Test" and "TTS · Qwen3-TTS Base Test". Both run on a single GPU so the pilot is
+cheap to reproduce. This is a pilot, not a rollout: no dashboard/visualization
+lives in this repo, and nothing is gated on coverage.
+
+**Naming convention**: `coverage-<model_id>-<mode>.xml`, where `<model_id>`
+is the model's directory name under `vllm_omni/diffusion/models/<model_id>/`
+or `vllm_omni/model_executor/models/<model_id>/` (e.g. `z_image`, `qwen3_omni`),
+and `<mode>` is `online` or `offline`.
+
+**Opting in a new model**: if the job runs offline and online tests in one
+combined `pytest` command today, split it into two sequential invocations —
+one per mode — each with its own `--cov=vllm_omni
+--cov-report=xml:coverage-<model_id>-<mode>.xml`, then upload both with one
+`buildkite-agent artifact upload "coverage-<model_id>-*.xml"`. Keep the step red
+if either sub-run *or* the upload failed — the artifact is the deliverable, so a
+failed upload must not report green:
+
+```yaml
+commands:
+  - |
+    set +e
+    pytest -s -v <offline test file(s)> <existing markers/run-level> --cov=vllm_omni --cov-report=xml:coverage-<model_id>-offline.xml
+    EXIT_OFFLINE=$$?
+    pytest -s -v <online test file(s)> <existing markers/run-level> --cov=vllm_omni --cov-report=xml:coverage-<model_id>-online.xml
+    EXIT_ONLINE=$$?
+    EXIT=0
+    [ $$EXIT_OFFLINE -ne 0 ] && EXIT=1
+    [ $$EXIT_ONLINE -ne 0 ] && EXIT=1
+    buildkite-agent artifact upload "coverage-<model_id>-*.xml"
+    EXIT_UPLOAD=$$?
+    [ $$EXIT_UPLOAD -ne 0 ] && EXIT=1
+    exit $$EXIT
+```
+
+Before splitting, confirm each half actually collects at least one test under the job's `-m`/`--run-level` filter — pytest exits with code 5 ("no tests collected") if a half is empty, and this failure-handling idiom treats that as a job failure, red-ing a job that used to pass as one combined invocation.
+
+Also check the tests' `num_cards` against the job's `mirror_hardwares` preset.
+`cuda_marks` turns `num_cards > 1` into `skipif(device_count() < num_cards)`, so a
+test asking for more GPUs than the preset provides is silently skipped and its
+coverage artifact comes back empty. Splitting such a job produces a file that
+looks fine and measures nothing — "Diffusion · Z Image Test" is the current
+example (online tests want 4 cards, the job runs on `l4_1`), which is why it is
+not a coverage pilot.
+
+Online-mode coverage depends on the `[tool.coverage.run]` `patch`/`sigterm`
+settings in `pyproject.toml`: online tests launch the server with
+`subprocess.Popen` and stop it with SIGTERM, and without those settings the XML
+reflects only the pytest parent process, not the server's code paths.
+
+Because these jobs are diff-gated on model/test paths, editing only CI YAML does
+not schedule them — a PR that changes the coverage wiring itself must trigger a
+full E2E run (or run the commands on a GPU host) to produce artifacts. When
+checking a new model's artifacts, compare `lines-covered` between the online and
+offline XML rather than just confirming both files exist.
+
 ### Validation checklist
 
 | Check | Command / location |
