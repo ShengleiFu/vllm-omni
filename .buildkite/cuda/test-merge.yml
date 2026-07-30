@@ -90,13 +90,26 @@ steps:
           - vllm_omni/model_executor/models/qwen3_tts/
           - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
           - vllm_omni/deploy/qwen3_tts.yaml
+        # Each half keeps the whole job's original 40m budget, so neither can time
+        # out earlier than the un-split job did. Keep the per-invocation timeouts:
+        # they bound a hung half and still let the upload run; this cap does not.
+        timeout_in_minutes: 60
         commands:
           - |
-            timeout 40m bash -c "
-              export VLLM_LOGGING_LEVEL=DEBUG
-              export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-              pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py tests/e2e/offline_inference/test_qwen3_tts_base.py -m 'advanced_model and cuda' --run-level 'advanced_model'
-            "
+            set +e
+            export VLLM_LOGGING_LEVEL=DEBUG
+            export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+            timeout 40m pytest -s -v tests/e2e/offline_inference/test_qwen3_tts_base.py -m 'advanced_model and cuda' --run-level 'advanced_model' --cov=vllm_omni --cov-report=xml:coverage-qwen3_tts-offline.xml
+            EXIT_OFFLINE=$$?
+            timeout 40m pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py -m 'advanced_model and cuda' --run-level 'advanced_model' --cov=vllm_omni --cov-report=xml:coverage-qwen3_tts-online.xml
+            EXIT_ONLINE=$$?
+            EXIT=0
+            [ $$EXIT_OFFLINE -ne 0 ] && EXIT=1
+            [ $$EXIT_ONLINE -ne 0 ] && EXIT=1
+            buildkite-agent artifact upload "coverage-qwen3_tts-*.xml"
+            EXIT_UPLOAD=$$?
+            [ $$EXIT_UPLOAD -ne 0 ] && EXIT=1
+            exit $$EXIT
         mirror_hardwares: l4_1
 
       - label: "TTS · Higgs-Audio-V3 Test"
@@ -242,9 +255,22 @@ steps:
           - vllm_omni/diffusion/models/bagel/
           - vllm_omni/model_executor/stage_input_processors/bagel.py
           - vllm_omni/deploy/bagel.yaml
-        timeout_in_minutes: 20
+        # 20 -> 40: the split pays a second model load, and 20m was sized for one.
+        timeout_in_minutes: 40
         commands:
-          - pytest -s -v tests/e2e/offline_inference/test_bagel.py tests/e2e/online_serving/test_bagel.py -m 'advanced_model and cuda' --run-level 'advanced_model'
+          - |
+            set +e
+            pytest -s -v tests/e2e/offline_inference/test_bagel.py -m 'advanced_model and cuda' --run-level 'advanced_model' --cov=vllm_omni --cov-report=xml:coverage-bagel-offline.xml
+            EXIT_OFFLINE=$$?
+            pytest -s -v tests/e2e/online_serving/test_bagel.py -m 'advanced_model and cuda' --run-level 'advanced_model' --cov=vllm_omni --cov-report=xml:coverage-bagel-online.xml
+            EXIT_ONLINE=$$?
+            EXIT=0
+            [ $$EXIT_OFFLINE -ne 0 ] && EXIT=1
+            [ $$EXIT_ONLINE -ne 0 ] && EXIT=1
+            buildkite-agent artifact upload "coverage-bagel-*.xml"
+            EXIT_UPLOAD=$$?
+            [ $$EXIT_UPLOAD -ne 0 ] && EXIT=1
+            exit $$EXIT
         mirror_hardwares: h100_1
 
       - label: "Diffusion · Qwen Image Test"
