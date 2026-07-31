@@ -358,8 +358,13 @@ commands:
 ```
 
 Give each half the whole job's original budget rather than a share of it, so no
-half can time out earlier than the un-split job would have, and raise
-`timeout_in_minutes` to cover both halves — the split pays a second model load.
+half can time out earlier than the un-split job would have. Then set
+`timeout_in_minutes` above the sum of both `--timeout` budgets plus upload
+margin: it kills the step outright, so a lower cap would end a half before its
+own timeout fires and lose the artifacts.
+
+Pass multiple paths to `--offline`/`--online` as one quoted argument
+(`--offline 'a.py b.py'`); a bare second path is read as an unknown flag.
 
 Before splitting, confirm each half actually collects at least one test under the job's `-m`/`--run-level` filter — pytest exits with code 5 ("no tests collected") if a half is empty, which the script reports as a failure, red-ing a job that used to pass as one combined invocation.
 

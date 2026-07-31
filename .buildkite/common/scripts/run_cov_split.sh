@@ -7,14 +7,16 @@
 #
 #   --model-id   Names the artifacts: coverage-<id>-{offline,online}.xml. Use the
 #                model's directory name under vllm_omni/*/models/.
-#   --offline    Space-separated pytest paths for the offline half.
-#   --online     Space-separated pytest paths for the online half.
+#   --offline    Pytest path(s) for the offline half. Quote as one argument to
+#                pass more than one: --offline 'a.py b.py'.
+#   --online     Pytest path(s) for the online half, same quoting rule.
 #   --markers    Passed to pytest -m.
 #   --run-level  Passed to pytest --run-level.
 #   --timeout    Per-half `timeout` duration (default 40m). Each half gets the
 #                whole budget: a half must not fail earlier than the un-split job
 #                would have. This bounds a hung half while letting the script
-#                continue, which is what still gets the artifacts uploaded.
+#                continue, which is what still gets the artifacts uploaded — so
+#                the step's own timeout_in_minutes must sit above 2x this value.
 #
 # Exits non-zero if either half or the upload failed.
 set -uo pipefail
