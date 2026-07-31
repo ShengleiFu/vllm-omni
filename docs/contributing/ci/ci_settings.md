@@ -340,32 +340,28 @@ is the model's directory name under `vllm_omni/diffusion/models/<model_id>/`
 or `vllm_omni/model_executor/models/<model_id>/` (e.g. `z_image`, `qwen3_omni`),
 and `<mode>` is `online` or `offline`.
 
-**Opting in a new model**: if the job runs offline and online tests in one
-combined `pytest` command today, split it into two sequential invocations —
-one per mode — each with its own `--cov=vllm_omni
---cov-report=xml:coverage-<model_id>-<mode>.xml`, then upload both with one
-`buildkite-agent artifact upload "coverage-<model_id>-*.xml"`. Keep the step red
-if either sub-run *or* the upload failed — the artifact is the deliverable, so a
-failed upload must not report green:
+**Opting in a new model**: replace the job's combined `pytest` command with
+[`run_cov_split.sh`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/run_cov_split.sh),
+which runs each mode, names the reports, uploads them, and fails the step if
+either half or the upload failed:
 
 ```yaml
 commands:
   - |
-    set +e
-    pytest -s -v <offline test file(s)> <existing markers/run-level> --cov=vllm_omni --cov-report=xml:coverage-<model_id>-offline.xml
-    EXIT_OFFLINE=$$?
-    pytest -s -v <online test file(s)> <existing markers/run-level> --cov=vllm_omni --cov-report=xml:coverage-<model_id>-online.xml
-    EXIT_ONLINE=$$?
-    EXIT=0
-    [ $$EXIT_OFFLINE -ne 0 ] && EXIT=1
-    [ $$EXIT_ONLINE -ne 0 ] && EXIT=1
-    buildkite-agent artifact upload "coverage-<model_id>-*.xml"
-    EXIT_UPLOAD=$$?
-    [ $$EXIT_UPLOAD -ne 0 ] && EXIT=1
-    exit $$EXIT
+    .buildkite/common/scripts/run_cov_split.sh \
+      --model-id <model_id> \
+      --offline <offline test path(s)> \
+      --online <online test path(s)> \
+      --markers '<the job's existing -m expression>' \
+      --run-level <the job's existing --run-level> \
+      --timeout <per-half budget, default 40m>
 ```
 
-Before splitting, confirm each half actually collects at least one test under the job's `-m`/`--run-level` filter — pytest exits with code 5 ("no tests collected") if a half is empty, and this failure-handling idiom treats that as a job failure, red-ing a job that used to pass as one combined invocation.
+Give each half the whole job's original budget rather than a share of it, so no
+half can time out earlier than the un-split job would have, and raise
+`timeout_in_minutes` to cover both halves — the split pays a second model load.
+
+Before splitting, confirm each half actually collects at least one test under the job's `-m`/`--run-level` filter — pytest exits with code 5 ("no tests collected") if a half is empty, which the script reports as a failure, red-ing a job that used to pass as one combined invocation.
 
 Also check the tests' `num_cards` against the job's `mirror_hardwares` preset.
 `cuda_marks` turns `num_cards > 1` into `skipif(device_count() < num_cards)`, so a
