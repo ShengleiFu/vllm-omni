@@ -94,6 +94,7 @@ steps:
           - vllm_omni/model_executor/models/qwen3_tts/
           - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
           - vllm_omni/deploy/qwen3_tts.yaml
+          - .buildkite/common/scripts/run_cov_split.sh
         # Must exceed both --timeout budgets plus upload margin, or this cap
         # kills a half before its own timeout fires and the artifacts are lost.
         timeout_in_minutes: 85
@@ -205,6 +206,7 @@ steps:
           - vllm_omni/diffusion/models/bagel/
           - vllm_omni/model_executor/stage_input_processors/bagel.py
           - vllm_omni/deploy/bagel.yaml
+          - .buildkite/common/scripts/run_cov_split.sh
         # Must exceed both --timeout budgets plus upload margin (20m was sized
         # for a single un-split run).
         timeout_in_minutes: 45

@@ -381,11 +381,13 @@ settings in `pyproject.toml`: online tests launch the server with
 `subprocess.Popen` and stop it with SIGTERM, and without those settings the XML
 reflects only the pytest parent process, not the server's code paths.
 
-Because these jobs are diff-gated on model/test paths, editing only CI YAML does
-not schedule them — a PR that changes the coverage wiring itself must trigger a
-full E2E run (or run the commands on a GPU host) to produce artifacts. When
-checking a new model's artifacts, compare `lines-covered` between the online and
-offline XML rather than just confirming both files exist.
+List `run_cov_split.sh` in every opted-in job's `source_file_dependencies`, so a
+change to the shared helper schedules the jobs that depend on it instead of
+surfacing as a nightly failure. Editing only the surrounding CI YAML still does
+not schedule them, so a PR that touches just the wiring needs a full E2E run (or
+the commands run on a GPU host) to produce artifacts. When checking a new model's
+artifacts, compare `lines-covered` between the online and offline XML rather than
+just confirming both files exist.
 
 ### Validation checklist
 
