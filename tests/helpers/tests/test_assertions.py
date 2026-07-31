@@ -69,3 +69,22 @@ def test_resolve_transcript_leaves_language_unset_by_default(monkeypatch):
 
     assert captured["language"] is None
     assert captured["model_size"] == "small"
+
+
+def test_escalated_transcript_keeps_declared_language(monkeypatch):
+    # The escalated pass must honour the same language, otherwise a request that
+    # pins one silently falls back to auto-detection on retry.
+    captured = _capture_transcribe(monkeypatch)
+
+    with pytest.raises(AssertionError, match="after ASR escalation"):
+        _assert_transcript_matches(
+            "totally different words",
+            audio_bytes=b"fake-wav",
+            expected_text="how are you",
+            threshold=0.9,
+            escalation_model="large-v3",
+            language="en",
+        )
+
+    assert captured["model_size"] == "large-v3"
+    assert captured["language"] == "en"

@@ -4,7 +4,9 @@
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import soundfile as sf
 
 from tests.helpers import media
 
@@ -46,3 +48,34 @@ def test_transcribe_defaults_to_auto_language(monkeypatch):
     media._whisper_transcribe_in_current_process("/tmp/does-not-matter.wav", "small")
 
     assert captured.get("language") is None
+
+
+def test_bytes_entrypoint_forwards_language_to_subprocess(monkeypatch, tmp_path):
+    """Cover the two hops the tests above skip: bytes -> file -> executor.submit.
+
+    The real call crosses a spawn ProcessPoolExecutor, so capture what gets
+    submitted rather than what the worker eventually does.
+    """
+    submitted: dict = {}
+
+    class FakeExecutor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def submit(self, fn, *args):
+            submitted["fn"] = fn
+            submitted["args"] = args
+            return SimpleNamespace(result=lambda: "London")
+
+    monkeypatch.setattr(media.concurrent.futures, "ProcessPoolExecutor", lambda *a, **kw: FakeExecutor())
+
+    wav = tmp_path / "clip.wav"
+    sf.write(wav, np.zeros(2400, dtype=np.float32), 24000)
+
+    assert media.convert_audio_bytes_to_text(wav.read_bytes(), "small", "en") == "London"
+
+    assert submitted["fn"] is media._whisper_transcribe_in_current_process
+    assert submitted["args"][1:] == ("small", "en")
