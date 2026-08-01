@@ -4,6 +4,8 @@
 E2E Online tests for Qwen3-Omni model.
 """
 
+import concurrent.futures
+import math
 import os
 
 import pytest
@@ -449,14 +451,60 @@ def test_audio_in_video_default_loader_sampling_regression(omni_server, openai_c
     openai_client.send_omni_request(dict(base_config))
 
 
+# Whether a one-word answer is pronounced intelligibly is sampled, not guaranteed: the
+# talker runs at temperature 0.9 (the upstream default, see qwen3_omni_moe.yaml stage 1).
+# Asserting it per request therefore gates on a random variable, which is what the old
+# 10-retry loop was compensating for. Measure a success rate instead.
+_AUDIO_MISMATCH_MSG = "The audio content is not same as the text"
+_ONE_WORD_REQUESTS = 40
+_ONE_WORD_MIN_SUCCESSES = 29
+
+
+def _wilson_interval(successes: int, total: int, z: float = 1.96) -> str:
+    """95% Wilson interval, so a failure report shows whether the miss is marginal."""
+    p = successes / total
+    denom = 1 + z * z / total
+    centre = (p + z * z / (2 * total)) / denom
+    half = z / denom * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total))
+    return f"{max(0.0, centre - half):.1%}-{min(1.0, centre + half):.1%}"
+
+
+def _one_word_attempt(openai_client, request_config) -> str | None:
+    """Return None on success, or the failure text when the audio did not say the word.
+
+    Only an audio mismatch is absorbed into the success-rate budget. Anything else —
+    HTTP failure, missing audio, a text-keyword miss — propagates, so a broken server
+    cannot hide inside the tolerated quality failures.
+    """
+    try:
+        openai_client.send_omni_request(request_config)
+        return None
+    except AssertionError as exc:
+        if _AUDIO_MISMATCH_MSG in str(exc):
+            return str(exc)
+        raise
+
+
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_one_word_prompt_001(omni_server, openai_client) -> None:
-    """
+    """Catastrophic-regression gate on one-word pronunciation.
+
+    Sends a fixed 40 requests and requires at least 29 to transcribe as the expected
+    word. Thresholds were fixed in advance from a measured healthy baseline of 85.6%
+    (the HF reference implementation, which is the weaker of the two healthy runs
+    measured; vLLM-Omni itself measured 92.2%):
+
+        >=29/40   0.9% chance of failing a healthy run,  92.9% chance of catching a
+                  drop to 60%,  55.9% chance of catching a drop to 70%
+
+    A drop to 70% is only caught about half the time, so this is a smoke gate for gross
+    pipeline breakage, not a quality tracker -- resolving moderate drift needs ~80+
+    samples and belongs in an accuracy benchmark. See #5395.
+
     Input Modal: text only (one-word answer constraint).
     Output Modal: text, audio (default ``modalities``); ``key_words`` only assert on text.
     Input Setting: stream=True
-    Datasets: single request
     """
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
@@ -474,17 +522,24 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
         "transcript_language": "en",
     }
 
-    # Retry only when assert_omni_response fails on text/audio cosine similarity (see tests/helpers/assertions.py).
-    _similarity_assert_msg = "The audio content is not same as the text"
-    _max_retries = 10
-    for attempt in range(_max_retries):
-        try:
-            openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
-            break
-        except AssertionError as e:
-            if _similarity_assert_msg not in str(e) or attempt == _max_retries - 1:
-                raise
-            print(f"Similarity assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
+    batch = get_max_batch_size()
+    failures: list[str] = []
+    # No retries and no early exit: both would bias the rate this test is measuring.
+    for start in range(0, _ONE_WORD_REQUESTS, batch):
+        size = min(batch, _ONE_WORD_REQUESTS - start)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=size) as executor:
+            for outcome in executor.map(lambda _: _one_word_attempt(openai_client, request_config), range(size)):
+                if outcome is not None:
+                    failures.append(outcome)
+
+    successes = _ONE_WORD_REQUESTS - len(failures)
+    print(f"one-word intelligibility: {successes}/{_ONE_WORD_REQUESTS} succeeded")
+    assert successes >= _ONE_WORD_MIN_SUCCESSES, (
+        f"one-word intelligibility {successes}/{_ONE_WORD_REQUESTS} is below the "
+        f"{_ONE_WORD_MIN_SUCCESSES}/{_ONE_WORD_REQUESTS} gate "
+        f"(95% CI {_wilson_interval(successes, _ONE_WORD_REQUESTS)}). Failures:\n"
+        + "\n".join(f"  - {f}" for f in failures)
+    )
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
