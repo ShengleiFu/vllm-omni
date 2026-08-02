@@ -3,9 +3,12 @@ import torch
 
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 
+# `cpu` is the lane selector, not a hardware claim: the only Buildkite steps that
+# reach tests/ select `core_model and cpu`, and they run on GPU hardware (l4_1).
+# Marking this `cuda` collects it nowhere. Real hardware need is the skipif below.
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    pytest.mark.cpu,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device"),
 ]
 

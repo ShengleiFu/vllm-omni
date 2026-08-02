@@ -951,11 +951,11 @@ def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkey
         query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.long),
     )
 
+    # Exact indices pin the mapping: r3 keeps slot 2 rather than shifting into
+    # the skipped r2's slot.
     assert torch.equal(output.inter_stage_outputs[0]["codes.audio"], codes[0:1])
     assert output.inter_stage_outputs[1] is None
     assert torch.equal(output.inter_stage_outputs[2]["codes.audio"], codes[2:3])
-    # r3's slice must not have shifted onto r2's would-be position.
-    assert not torch.equal(output.inter_stage_outputs[2]["codes.audio"], codes[1:2])
 
 
 def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_downstream_batch(monkeypatch):
@@ -967,16 +967,24 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
     must still map correctly onto a partial downstream batch. This is a
     distinct code path from test_build_omni_output_filters_multimodal_by_partial_downstream_batch,
     which only exercises the no-prefix-cache-merge (mm_cpu) fallback.
+
+    The merge itself is stubbed out here; what this pins is the branch selection
+    plus _unwrap_lists' batch-index selection for a list-valued key.
     """
     runner = _make_async_output_runner(engine_output_type="latent")
     runner.requests = {"r1": object(), "r2": object(), "r3": object()}
     runner.omni_prefix_cache = object()
 
+    # codes.ref arrives whole for every request: the prefix-cache merge uses
+    # pass_lists_through, so selecting this request's entry is _unwrap_lists'
+    # job, and it selects by batch index (r3 -> 2), not by downstream position.
+    ref_codes = [torch.tensor([1]), torch.tensor([2]), torch.tensor([3])]
     combined_mm = {
         "codes.audio": {
             "r1": torch.tensor([[11.0, 12.0]]),
             "r3": torch.tensor([[31.0, 32.0]]),
-        }
+        },
+        "codes.ref": {"r1": list(ref_codes), "r3": list(ref_codes)},
     }
 
     monkeypatch.setattr(
@@ -1022,3 +1030,6 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
     assert torch.equal(output.inter_stage_outputs[0]["codes.audio"], combined_mm["codes.audio"]["r1"])
     assert output.inter_stage_outputs[1] is None
     assert torch.equal(output.inter_stage_outputs[2]["codes.audio"], combined_mm["codes.audio"]["r3"])
+
+    assert torch.equal(output.inter_stage_outputs[0]["codes.ref"], ref_codes[0])
+    assert torch.equal(output.inter_stage_outputs[2]["codes.ref"], ref_codes[2])
