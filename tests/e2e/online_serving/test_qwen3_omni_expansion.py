@@ -481,14 +481,17 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
     """Catastrophic-regression gate on one-word pronunciation.
 
     Sends a fixed 40 requests and requires at least 29 to transcribe as the expected
-    word. Thresholds were fixed in advance from a measured healthy baseline of 85.6%
-    (the HF reference implementation, which is the weaker of the two healthy runs
-    measured; vLLM-Omni itself measured 92.2%):
+    word. 85.6% is a predeclared minimum acceptable success probability, taken from a
+    measured HF reference run (77/90); vLLM-Omni itself measured 92.2%. Assuming 40
+    independent Bernoulli trials, >=29/40 has a nominal rejection probability of 0.9%
+    at p=.856, with 92.9% power at p=.60 and 55.9% at p=.70.
 
-        >=29/40   0.9% chance of failing a healthy run,  92.9% chance of catching a
-                  drop to 60%,  55.9% chance of catching a drop to 70%
+    Those are conditional on p, not a measured false-failure rate for this CI: 77/90 is
+    one point estimate (Wilson 76.8%-91.4%), and at the low end of that interval the gate
+    would reject about 20% of runs. Pinning down a real rate would take repeated
+    report-only runs on the target hardware.
 
-    A drop to 70% is only caught about half the time, so this is a smoke gate for gross
+    A drop to 70% is caught only about half the time, so this is a smoke gate for gross
     pipeline breakage, not a quality tracker -- resolving moderate drift needs ~80+
     samples and belongs in an accuracy benchmark. See #5395.
 
@@ -515,6 +518,10 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
     batch = get_max_batch_size()
     failures: list[str] = []
     # No retries and no early exit: both would bias the rate this test is measuring.
+    # Per-request outcomes are needed to count them, so the assertion runs inside each
+    # worker. That also transcribes concurrently, where the previous request_num=5 path
+    # sent concurrently but judged serially -- worth watching on tighter cards, since
+    # each judge loads whisper on the same device as the talker and code2wav stages.
     for start in range(0, _ONE_WORD_REQUESTS, batch):
         size = min(batch, _ONE_WORD_REQUESTS - start)
         with concurrent.futures.ThreadPoolExecutor(max_workers=size) as executor:
