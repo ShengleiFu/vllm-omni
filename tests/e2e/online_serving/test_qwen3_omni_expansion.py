@@ -5,12 +5,12 @@ E2E Online tests for Qwen3-Omni model.
 """
 
 import concurrent.futures
-import math
 import os
 
 import pytest
 from openai import BadRequestError
 
+from tests.helpers.assertions import is_audio_mismatch, wilson_interval
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
@@ -455,18 +455,8 @@ def test_audio_in_video_default_loader_sampling_regression(omni_server, openai_c
 # talker runs at temperature 0.9 (the upstream default, see qwen3_omni_moe.yaml stage 1).
 # Asserting it per request therefore gates on a random variable, which is what the old
 # 10-retry loop was compensating for. Measure a success rate instead.
-_AUDIO_MISMATCH_MSG = "The audio content is not same as the text"
 _ONE_WORD_REQUESTS = 40
 _ONE_WORD_MIN_SUCCESSES = 29
-
-
-def _wilson_interval(successes: int, total: int, z: float = 1.96) -> str:
-    """95% Wilson interval, so a failure report shows whether the miss is marginal."""
-    p = successes / total
-    denom = 1 + z * z / total
-    centre = (p + z * z / (2 * total)) / denom
-    half = z / denom * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total))
-    return f"{max(0.0, centre - half):.1%}-{min(1.0, centre + half):.1%}"
 
 
 def _one_word_attempt(openai_client, request_config) -> str | None:
@@ -480,7 +470,7 @@ def _one_word_attempt(openai_client, request_config) -> str | None:
         openai_client.send_omni_request(request_config)
         return None
     except AssertionError as exc:
-        if _AUDIO_MISMATCH_MSG in str(exc):
+        if is_audio_mismatch(exc):
             return str(exc)
         raise
 
@@ -537,7 +527,7 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
     assert successes >= _ONE_WORD_MIN_SUCCESSES, (
         f"one-word intelligibility {successes}/{_ONE_WORD_REQUESTS} is below the "
         f"{_ONE_WORD_MIN_SUCCESSES}/{_ONE_WORD_REQUESTS} gate "
-        f"(95% CI {_wilson_interval(successes, _ONE_WORD_REQUESTS)}). Failures:\n"
+        f"(95% CI {wilson_interval(successes, _ONE_WORD_REQUESTS)}). Failures:\n"
         + "\n".join(f"  - {f}" for f in failures)
     )
 

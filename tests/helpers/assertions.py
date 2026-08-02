@@ -2,6 +2,7 @@
 
 import io
 import json
+import math
 import tempfile
 import threading
 import wave
@@ -24,6 +25,30 @@ from tests.helpers.media import (
 
 _GENDER_PIPELINE = None
 _GENDER_PIPELINE_LOCK = threading.Lock()
+# Raised when generated audio does not match the generated text. Exported because a
+# caller sampling a success rate has to tell this apart from a serving failure, and a
+# test matching the wording by hand would silently stop matching if it were reworded.
+AUDIO_MISMATCH_MESSAGE = "The audio content is not same as the text"
+
+
+def is_audio_mismatch(exc: BaseException) -> bool:
+    """True when a failure is audio not matching the text, rather than a serving error.
+
+    A test that tolerates a few mismatches while measuring a success rate must not
+    tolerate an HTTP failure, missing audio or a text-keyword miss as well.
+    """
+    return isinstance(exc, AssertionError) and AUDIO_MISMATCH_MESSAGE in str(exc)
+
+
+def wilson_interval(successes: int, total: int, z: float = 1.96) -> str:
+    """Format a 95% Wilson score interval, so a rate failure shows how marginal it is."""
+    p = successes / total
+    denom = 1 + z * z / total
+    centre = (p + z * z / (2 * total)) / denom
+    half = z / denom * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total))
+    return f"{max(0.0, centre - half):.1%}-{min(1.0, centre + half):.1%}"
+
+
 # Transcript gates default to whisper ``small`` for speed. ``small`` mishears a
 # short TTS clip ~0.5% of the time (e.g. "Hello"->"fellow", or hallucinating a
 # leading SFX token), which flakes the deterministic similarity gate. Short
@@ -602,7 +627,7 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                     shorter_clean = _re.sub(r"[^\w\s]", "", shorter).strip()
                     longer_clean = _re.sub(r"[^\w\s]", "", longer).strip()
                     assert shorter_clean and (shorter_clean in longer_clean), (
-                        f"The audio content is not same as the text "
+                        f"{AUDIO_MISMATCH_MESSAGE} "
                         f"(short-text containment check failed: "
                         f"text={text_output!r}, transcript={transcript!r})"
                     )
@@ -613,7 +638,7 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                         text_output.lower(),
                     )
                     print(f"similarity is: {similarity}")
-                    assert similarity > similarity_threshold, "The audio content is not same as the text"
+                    assert similarity > similarity_threshold, AUDIO_MISMATCH_MESSAGE
             if audio_ref_text:
                 assert transcript is not None, "No audio transcript for reference-text validation"
                 audio_similarity = cosine_similarity_text(
