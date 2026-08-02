@@ -4,6 +4,7 @@
 
 import random
 from dataclasses import dataclass
+from typing import Any
 
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
@@ -28,7 +29,7 @@ class OmniDiffusionRequest:
     prompt: OmniPromptType
     sampling_params: OmniDiffusionSamplingParams
     request_id: str
-    kv_sender_info: dict | None = None
+    kv_sender_info: dict[str, Any] | None = None
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
@@ -40,12 +41,11 @@ class OmniDiffusionRequest:
         if self.sampling_params.generator is None and self.sampling_params.seed is None:
             self.sampling_params.seed = random.randint(0, 2**31 - 1)
 
-        # Detect whether user explicitly provided guidance_scale.
-        # The sentinel default is 0.0 (false-like); any truthy value means
-        # the caller set it intentionally.  We must resolve this BEFORE
-        # auto-filling guidance_scale_2, otherwise the sentinel leaks into
-        # guidance_scale_2.
-        if self.sampling_params.guidance_scale:
+        # Detect whether the caller explicitly provided guidance_scale before
+        # resolving the omitted value.  ``0.0`` is API-valid and must not be
+        # treated as omission because that would unexpectedly enable CFG in
+        # pipelines with a model-specific default above zero.
+        if self.sampling_params.guidance_scale is not None:
             self.sampling_params.guidance_scale_provided = True
         else:
             self.sampling_params.guidance_scale = 1.0

@@ -5,6 +5,7 @@ from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+
 DEFAULT_SEQ_LEN = 15
 NUM_BLOCKS = 10
 BLOCK_SIZE = 4
