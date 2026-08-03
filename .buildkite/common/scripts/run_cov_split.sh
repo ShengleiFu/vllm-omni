@@ -1,46 +1,43 @@
 #!/usr/bin/env bash
-# Run a model's offline and online E2E tests as separate coverage runs and upload
-# both reports, so per-mode attribution survives (see vllm-project/vllm-omni#5332).
+# Run a model's E2E tests once per entry mode as separate coverage runs and upload
+# the reports, so per-mode attribution survives (see vllm-project/vllm-omni#5332).
 #
-# Usage: run_cov_split.sh --model-id <id> --offline <paths> --online <paths> \
-#                         --markers <expr> --run-level <level> [--timeout <dur>]
+# Usage: run_cov_split.sh --model-id <id> [--offline <paths>] [--online <paths>] \
+#                         --markers <expr> [--pytest-args <args>]
 #
-#   --model-id   Names the artifacts: coverage-<id>-{offline,online}.xml. Use the
-#                model's directory name under vllm_omni/*/models/.
-#   --offline    Pytest path(s) for the offline half. Quote as one argument to
-#                pass more than one: --offline 'a.py b.py'.
-#   --online     Pytest path(s) for the online half, same quoting rule.
-#   --markers    Passed to pytest -m.
-#   --run-level  Passed to pytest --run-level.
-#   --timeout    Per-half `timeout` duration (default 40m). Each half gets the
-#                whole budget: a half must not fail earlier than the un-split job
-#                would have. This bounds a hung half while letting the script
-#                continue, which is what still gets the artifacts uploaded — so
-#                the step's own timeout_in_minutes must sit above 2x this value.
+#   --model-id     Names the artifacts: coverage-<id>-{offline,online}.xml. Use the
+#                  model's directory name under vllm_omni/*/models/.
+#   --offline      Pytest path(s) for the offline half. Quote as one argument to
+#                  pass more than one: --offline 'a.py b.py'.
+#   --online       Pytest path(s) for the online half, same quoting rule.
+#   --markers      Passed to pytest -m.
+#   --pytest-args  Extra pytest arguments appended to every run, e.g.
+#                  '--run-level advanced_model' or '--test-config-file x.json'.
 #
-# Exits non-zero if either half or the upload failed.
+# At least one of --offline/--online is required, so a job with only one mode runs
+# just that half. Total runtime is bounded by the step's timeout_in_minutes.
+#
+# Exits non-zero if any half or the upload failed.
 set -uo pipefail
 
 MODEL_ID=""
 OFFLINE=""
 ONLINE=""
 MARKERS=""
-RUN_LEVEL=""
-TIMEOUT="40m"
+PYTEST_ARGS=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --model-id)  MODEL_ID="$2"; shift 2 ;;
-        --offline)   OFFLINE="$2"; shift 2 ;;
-        --online)    ONLINE="$2"; shift 2 ;;
-        --markers)   MARKERS="$2"; shift 2 ;;
-        --run-level) RUN_LEVEL="$2"; shift 2 ;;
-        --timeout)   TIMEOUT="$2"; shift 2 ;;
+        --model-id)    MODEL_ID="$2"; shift 2 ;;
+        --offline)     OFFLINE="$2"; shift 2 ;;
+        --online)      ONLINE="$2"; shift 2 ;;
+        --markers)     MARKERS="$2"; shift 2 ;;
+        --pytest-args) PYTEST_ARGS="$2"; shift 2 ;;
         *) echo "run_cov_split.sh: unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
-for required in MODEL_ID OFFLINE ONLINE MARKERS RUN_LEVEL; do
+for required in MODEL_ID MARKERS; do
     if [[ -z "${!required}" ]]; then
         flag="$(echo "${required//_/-}" | tr '[:upper:]' '[:lower:]')"
         echo "run_cov_split.sh: missing --${flag}" >&2
@@ -48,21 +45,24 @@ for required in MODEL_ID OFFLINE ONLINE MARKERS RUN_LEVEL; do
     fi
 done
 
-rm -f "coverage-${MODEL_ID}-offline.xml" "coverage-${MODEL_ID}-online.xml"
+if [[ -z "${OFFLINE}" && -z "${ONLINE}" ]]; then
+    echo "run_cov_split.sh: need at least one of --offline / --online" >&2
+    exit 2
+fi
 
 run_half() {
     local mode="$1"
     shift
     echo "--- coverage: ${MODEL_ID} ${mode}"
-    # shellcheck disable=SC2086  # paths are intentionally word-split
-    timeout "${TIMEOUT}" pytest -s -v $* \
-        -m "${MARKERS}" --run-level "${RUN_LEVEL}" \
+    rm -f "coverage-${MODEL_ID}-${mode}.xml"
+    # shellcheck disable=SC2086  # paths and extra args are intentionally split
+    pytest -s -v $* -m "${MARKERS}" ${PYTEST_ARGS} \
         --cov=vllm_omni --cov-report="xml:coverage-${MODEL_ID}-${mode}.xml"
 }
 
 EXIT=0
-run_half offline ${OFFLINE} || EXIT=1
-run_half online ${ONLINE} || EXIT=1
+[[ -n "${OFFLINE}" ]] && { run_half offline ${OFFLINE} || EXIT=1; }
+[[ -n "${ONLINE}" ]] && { run_half online ${ONLINE} || EXIT=1; }
 
 buildkite-agent artifact upload "coverage-${MODEL_ID}-*.xml" || EXIT=1
 

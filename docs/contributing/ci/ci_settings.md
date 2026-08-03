@@ -353,20 +353,16 @@ commands:
       --offline <offline test path(s)> \
       --online <online test path(s)> \
       --markers '<the job's existing -m expression>' \
-      --run-level <the job's existing --run-level> \
-      --timeout <per-half budget, default 40m>
+      --pytest-args '<the job's other pytest flags, e.g. --run-level advanced_model>'
 ```
 
-Give each half the whole job's original budget rather than a share of it, so no
-half can time out earlier than the un-split job would have. Then set
-`timeout_in_minutes` above the sum of both `--timeout` budgets plus upload
-margin: it kills the step outright, so a lower cap would end a half before its
-own timeout fires and lose the artifacts.
+Only one of `--offline`/`--online` is required, so a job with tests in a single
+mode runs just that half. Pass multiple paths to either as one quoted argument
+(`--offline 'a.py b.py'`); a bare second path is read as an unknown flag. Runtime
+is bounded solely by the step's `timeout_in_minutes` — raise it, since the split
+loads the model once per mode.
 
-Pass multiple paths to `--offline`/`--online` as one quoted argument
-(`--offline 'a.py b.py'`); a bare second path is read as an unknown flag.
-
-Before splitting, confirm each half actually collects at least one test under the job's `-m`/`--run-level` filter — pytest exits with code 5 ("no tests collected") if a half is empty, which the script reports as a failure, red-ing a job that used to pass as one combined invocation.
+Before splitting, confirm each half actually collects at least one test under the job's `-m`/`--pytest-args` filter — pytest exits with code 5 ("no tests collected") if a half is empty, which the script reports as a failure, red-ing a job that used to pass as one combined invocation.
 
 Also check the tests' `num_cards` against the job's `mirror_hardwares` preset.
 `cuda_marks` turns `num_cards > 1` into `skipif(device_count() < num_cards)`, so a
@@ -381,11 +377,13 @@ settings in `pyproject.toml`: online tests launch the server with
 `subprocess.Popen` and stop it with SIGTERM, and without those settings the XML
 reflects only the pytest parent process, not the server's code paths.
 
-List `run_cov_split.sh` in every opted-in job's `source_file_dependencies`, so a
-change to the shared helper schedules the jobs that depend on it instead of
-surfacing as a nightly failure. Editing only the surrounding CI YAML still does
-not schedule them, so a PR that touches just the wiring needs a full E2E run (or
-the commands run on a GPU host) to produce artifacts. When checking a new model's
+List both `run_cov_split.sh` and `pyproject.toml` in every opted-in job's
+`source_file_dependencies` — both change what the job measures, so without them a
+change there is filtered out of normal PR builds and only surfaces in a later
+nightly. `tests/buildkite/test_upload_pipeline.py` asserts this for the pilots.
+Editing only the surrounding CI YAML still does not schedule them, so a PR that
+touches just the wiring needs a full E2E run (or the commands run on a GPU host)
+to produce artifacts. When checking a new model's
 artifacts, compare `lines-covered` between the online and offline XML rather than
 just confirming both files exist.
 
