@@ -48,10 +48,14 @@ run_half() {
     local mode="$1"
     shift
     echo "--- coverage: ${MODEL_ID} ${mode}"
-    rm -f "coverage-${MODEL_ID}-${mode}.xml"
     pytest -s -v "$@" "${PYTEST_ARGS[@]}" \
         --cov=vllm_omni --cov-report="xml:coverage-${MODEL_ID}-${mode}.xml"
 }
+
+# Clear both modes, not just the ones being run: the upload glob matches both, so
+# a report left by an earlier run would otherwise be published as if the mode it
+# belongs to had run this time.
+rm -f "coverage-${MODEL_ID}-offline.xml" "coverage-${MODEL_ID}-online.xml"
 
 EXIT=0
 ((${#OFFLINE[@]})) && { run_half offline "${OFFLINE[@]}" || EXIT=1; }
