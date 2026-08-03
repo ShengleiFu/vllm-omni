@@ -350,19 +350,19 @@ commands:
   - |
     .buildkite/common/scripts/run_cov_split.sh \
       --model-id <model_id> \
-      --offline <offline test path(s)> \
-      --online <online test path(s)> \
-      --markers '<the job's existing -m expression>' \
-      --pytest-args '<the job's other pytest flags, e.g. --run-level advanced_model>'
+      --offline <offline test path> \
+      --online <online test path> \
+      -- <the job's existing pytest flags, e.g. -m '...' --run-level '...'>
 ```
 
-Only one of `--offline`/`--online` is required, so a job with tests in a single
-mode runs just that half. Pass multiple paths to either as one quoted argument
-(`--offline 'a.py b.py'`); a bare second path is read as an unknown flag. Runtime
-is bounded solely by the step's `timeout_in_minutes` — raise it, since the split
+Everything after `--` is forwarded verbatim to both runs with quoting preserved,
+so an expression like `-m 'advanced_model and cuda'` survives intact and a job can
+pass anything else it needs. `--offline`/`--online` are repeatable and only one is
+required, so a job with tests in a single mode runs just that half. Runtime is
+bounded solely by the step's `timeout_in_minutes` — raise it, since the split
 loads the model once per mode.
 
-Before splitting, confirm each half actually collects at least one test under the job's `-m`/`--pytest-args` filter — pytest exits with code 5 ("no tests collected") if a half is empty, which the script reports as a failure, red-ing a job that used to pass as one combined invocation.
+Before splitting, confirm each half actually collects at least one test under the job's forwarded filters — pytest exits with code 5 ("no tests collected") if a half is empty, which the script reports as a failure, red-ing a job that used to pass as one combined invocation.
 
 Also check the tests' `num_cards` against the job's `mirror_hardwares` preset.
 `cuda_marks` turns `num_cards > 1` into `skipif(device_count() < num_cards)`, so a

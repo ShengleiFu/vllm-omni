@@ -106,8 +106,7 @@ steps:
               --model-id qwen3_tts \
               --offline tests/e2e/offline_inference/test_qwen3_tts_base.py \
               --online tests/e2e/online_serving/test_qwen3_tts_base.py \
-              --markers 'advanced_model and cuda' \
-              --pytest-args '--run-level advanced_model'
+              -- -m 'advanced_model and cuda' --run-level 'advanced_model'
         mirror_hardwares: l4_1
 
       - label: "TTS · Higgs-Audio-V3 Test"
@@ -215,8 +214,7 @@ steps:
               --model-id bagel \
               --offline tests/e2e/offline_inference/test_bagel.py \
               --online tests/e2e/online_serving/test_bagel.py \
-              --markers 'advanced_model and cuda' \
-              --pytest-args '--run-level advanced_model'
+              -- -m 'advanced_model and cuda' --run-level 'advanced_model'
         mirror_hardwares: h100_1
 
       - label: "Diffusion · Qwen Image Test"
