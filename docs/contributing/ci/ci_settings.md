@@ -335,10 +335,26 @@ Test" and "TTS · Qwen3-TTS Base Test". Both run on a single GPU so the pilot is
 cheap to reproduce. This is a pilot, not a rollout: no dashboard/visualization
 lives in this repo, and nothing is gated on coverage.
 
-**Naming convention**: `coverage-<model_id>-<mode>.xml`, where `<model_id>`
-is the model's directory name under `vllm_omni/diffusion/models/<model_id>/`
-or `vllm_omni/model_executor/models/<model_id>/` (e.g. `z_image`, `qwen3_omni`),
-and `<mode>` is `online` or `offline`.
+**Naming convention**: `coverage-<model_id>-<mode>-<step_id>.xml`, where
+`<model_id>` is the model's directory name under
+`vllm_omni/diffusion/models/<model_id>/` or
+`vllm_omni/model_executor/models/<model_id>/` (e.g. `z_image`, `qwen3_omni`),
+`<mode>` is `online` or `offline`, and `<step_id>` is `BUILDKITE_STEP_ID`
+(`local` outside Buildkite).
+
+`<step_id>` is what keeps two steps that cover the same model apart. Artifacts are
+scoped to the build, and a nightly build carries the ready, merge and nightly tiers
+at once, so several same-model steps land in one namespace — `qwen3_tts` already has
+both a Base and a CustomVoice job, and `minicpmo_4_5` a base and a duplex one. Two
+uploads on one path do not fail loudly: an exact-name download can report the path
+as ambiguous, and a glob download fetches every match concurrently and renames each
+onto the same destination, so whichever finishes last wins. The step id remains the
+logical step identifier across retries, while Buildkite's default artifact lookup
+selects only the latest attempt — `BUILDKITE_JOB_ID` would instead give every
+attempt its own filename, leaving a failed attempt's partial report to be picked up
+alongside the real one. A step using `parallelism`/matrix would need
+`BUILDKITE_PARALLEL_JOB` added, since its jobs share a step id; neither pilot is
+one.
 
 **Opting in a new model**: replace the job's combined `pytest` command with
 [`run_cov_split.sh`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/run_cov_split.sh),

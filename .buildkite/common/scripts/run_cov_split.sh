@@ -5,8 +5,8 @@
 # Usage: run_cov_split.sh --model-id <id> [--offline <paths>] [--online <paths>] \
 #                         -- <pytest args...>
 #
-#   --model-id  Names the artifacts: coverage-<id>-{offline,online}.xml. Use the
-#               model's directory name under vllm_omni/*/models/.
+#   --model-id  Names the artifacts: coverage-<id>-{offline,online}-<step id>.xml.
+#               Use the model's directory name under vllm_omni/*/models/.
 #   --offline   Pytest path(s) for the offline half. Repeatable.
 #   --online    Pytest path(s) for the online half. Repeatable.
 #   --          Everything after this is forwarded verbatim to every pytest run,
@@ -44,23 +44,33 @@ if ((${#OFFLINE[@]} == 0 && ${#ONLINE[@]} == 0)); then
     exit 2
 fi
 
+# Two steps can test the same model, and artifacts are scoped to the build (a
+# nightly one carries the ready, merge and nightly tiers at once), so unsuffixed
+# reports would share a path -- a glob download then races to rename onto one file.
+# Not BUILDKITE_JOB_ID: the step id survives retries, so attempts collapse under
+# Buildkite's latest-attempt lookup instead of accumulating. A parallel step would
+# need BUILDKITE_PARALLEL_JOB as well; no pilot is one.
+REPORT_SUFFIX="${BUILDKITE_STEP_ID:-local}"
+OFFLINE_REPORT="coverage-${MODEL_ID}-offline-${REPORT_SUFFIX}.xml"
+ONLINE_REPORT="coverage-${MODEL_ID}-online-${REPORT_SUFFIX}.xml"
+
 run_half() {
     local mode="$1"
     shift
     echo "--- coverage: ${MODEL_ID} ${mode}"
     pytest -s -v "$@" "${PYTEST_ARGS[@]}" \
-        --cov=vllm_omni --cov-report="xml:coverage-${MODEL_ID}-${mode}.xml"
+        --cov=vllm_omni --cov-report="xml:coverage-${MODEL_ID}-${mode}-${REPORT_SUFFIX}.xml"
 }
 
 # Clear both modes, not just the ones being run: the upload glob matches both, so
 # a report left by an earlier run would otherwise be published as if the mode it
 # belongs to had run this time.
-rm -f "coverage-${MODEL_ID}-offline.xml" "coverage-${MODEL_ID}-online.xml"
+rm -f "${OFFLINE_REPORT}" "${ONLINE_REPORT}"
 
 EXIT=0
 ((${#OFFLINE[@]})) && { run_half offline "${OFFLINE[@]}" || EXIT=1; }
 ((${#ONLINE[@]})) && { run_half online "${ONLINE[@]}" || EXIT=1; }
 
-buildkite-agent artifact upload "coverage-${MODEL_ID}-*.xml" || EXIT=1
+buildkite-agent artifact upload "coverage-${MODEL_ID}-*-${REPORT_SUFFIX}.xml" || EXIT=1
 
 exit "${EXIT}"
