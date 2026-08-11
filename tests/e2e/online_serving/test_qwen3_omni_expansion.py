@@ -4,13 +4,11 @@
 E2E Online tests for Qwen3-Omni model.
 """
 
-import concurrent.futures
 import os
 
 import pytest
 from openai import BadRequestError
 
-from tests.helpers.assertions import is_audio_mismatch, wilson_interval
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
@@ -451,34 +449,15 @@ def test_audio_in_video_default_loader_sampling_regression(omni_server, openai_c
     openai_client.send_omni_request(dict(base_config))
 
 
-# Whether a one-word answer is pronounced intelligibly is sampled, not guaranteed: the
-# talker runs at temperature 0.9 (the upstream default, see qwen3_omni_moe.yaml stage 1).
-# Asserting it per request therefore gates on a random variable, which is what the old
-# 10-retry loop was compensating for. Measure a success rate instead.
-_ONE_WORD_REQUESTS = 40
-_ONE_WORD_MIN_SUCCESSES = 29
-
-
-def _one_word_attempt(openai_client, request_config) -> str | None:
-    """Return None on success, or the failure text when the audio did not say the word.
-
-    Only an audio mismatch is absorbed into the success-rate budget. Anything else —
-    HTTP failure, missing audio, a text-keyword miss — propagates, so a broken server
-    cannot hide inside the tolerated quality failures.
-    """
-    try:
-        openai_client.send_omni_request(request_config)
-        return None
-    except AssertionError as exc:
-        if is_audio_mismatch(exc):
-            return str(exc)
-        raise
-
-
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_one_word_prompt_001(omni_server, openai_client) -> None:
     """Catastrophic-regression gate on one-word pronunciation.
+
+    Whether a one-word answer is pronounced intelligibly is sampled, not guaranteed: the
+    talker runs at temperature 0.9 (the upstream default, see qwen3_omni_moe.yaml stage 1),
+    so asserting it per request gates on a random variable, which is what the old 10-retry
+    loop was compensating for.
 
     Sends a fixed 40 requests and requires at least 29 to transcribe as the expected
     word. 85.6% is a predeclared minimum acceptable success probability, taken from a
@@ -515,27 +494,12 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
         "transcript_language": "en",
     }
 
-    batch = get_max_batch_size()
-    failures: list[str] = []
-    # No retries and no early exit: both would bias the rate this test is measuring.
-    # Per-request outcomes are needed to count them, so the assertion runs inside each
-    # worker. That also transcribes concurrently, where the previous request_num=5 path
-    # sent concurrently but judged serially -- worth watching on tighter cards, since
-    # each judge loads whisper on the same device as the talker and code2wav stages.
-    for start in range(0, _ONE_WORD_REQUESTS, batch):
-        size = min(batch, _ONE_WORD_REQUESTS - start)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=size) as executor:
-            for outcome in executor.map(lambda _: _one_word_attempt(openai_client, request_config), range(size)):
-                if outcome is not None:
-                    failures.append(outcome)
-
-    successes = _ONE_WORD_REQUESTS - len(failures)
-    print(f"one-word intelligibility: {successes}/{_ONE_WORD_REQUESTS} succeeded")
-    assert successes >= _ONE_WORD_MIN_SUCCESSES, (
-        f"one-word intelligibility {successes}/{_ONE_WORD_REQUESTS} is below the "
-        f"{_ONE_WORD_MIN_SUCCESSES}/{_ONE_WORD_REQUESTS} gate "
-        f"(95% CI {wilson_interval(successes, _ONE_WORD_REQUESTS)}). Failures:\n"
-        + "\n".join(f"  - {f}" for f in failures)
+    # The judge runs per request so mismatches can be counted, which also transcribes
+    # concurrently where the previous request_num=5 path judged serially -- worth watching
+    # on tighter cards, since each judge loads whisper on the same device as the talker and
+    # code2wav stages.
+    openai_client.send_omni_request(
+        request_config, request_num=40, min_successes=29, max_concurrency=get_max_batch_size()
     )
 
 

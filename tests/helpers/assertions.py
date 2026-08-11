@@ -6,9 +6,12 @@ import math
 import tempfile
 import threading
 import wave
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 if TYPE_CHECKING:
     from tests.helpers.runtime import DiffusionResponse
@@ -23,21 +26,98 @@ from tests.helpers.media import (
     preprocess_text,
 )
 
+_ResponseT = TypeVar("_ResponseT")
+
 _GENDER_PIPELINE = None
 _GENDER_PIPELINE_LOCK = threading.Lock()
-# Raised when generated audio does not match the generated text. Exported because a
-# caller sampling a success rate has to tell this apart from a serving failure, and a
-# test matching the wording by hand would silently stop matching if it were reworded.
+
+# Assertions that sample a random variable rather than testing whether serving works:
+# whether TTS audio is intelligible enough to transcribe back, and whether a preset voice's
+# timbre estimates as the expected gender. Both are decided by the model and the estimator,
+# so a caller measuring a success rate has to tell them apart from a serving failure. The
+# messages are constants because a caller matching the wording by hand would silently stop
+# matching if it were reworded, reclassifying every quality failure as a hard failure.
 AUDIO_MISMATCH_MESSAGE = "The audio content is not same as the text"
+GENDER_MISMATCH_MESSAGE = "estimated gender is"
+_QUALITY_FAILURE_MESSAGES = (AUDIO_MISMATCH_MESSAGE, GENDER_MISMATCH_MESSAGE)
 
 
-def is_audio_mismatch(exc: BaseException) -> bool:
-    """True when a failure is audio not matching the text, rather than a serving error.
+@dataclass(frozen=True)
+class SuccessRateGate:
+    """Gate a sampled quality check on how many requests pass, not on each one passing.
 
-    A test that tolerates a few mismatches while measuring a success rate must not
-    tolerate an HTTP failure, missing audio or a text-keyword miss as well.
+    Built by the send helpers from their own arguments, so a test states a policy and never
+    touches this class. See ``collect_at_success_rate``.
+
+    Attributes:
+        min_successes: Fail below this many successes out of ``request_num``. Predeclare it
+            from a measured baseline; tuning it until CI passes defeats the gate.
+        concurrency: In-flight requests, in batches until the sample count is reached.
+            Defaults to sending all of them at once.
     """
-    return isinstance(exc, AssertionError) and AUDIO_MISMATCH_MESSAGE in str(exc)
+
+    min_successes: int
+    concurrency: int | None = None
+
+
+def is_quality_failure(exc: BaseException) -> bool:
+    """True when ``exc`` is one of the sampled quality assertions above.
+
+    A caller absorbing a few of these into a success-rate budget must not absorb an HTTP
+    failure, missing audio or a text-keyword miss as well, or a broken server passes.
+    """
+    if not isinstance(exc, AssertionError):
+        return False
+    return any(message in str(exc) for message in _QUALITY_FAILURE_MESSAGES)
+
+
+def collect_at_success_rate(
+    sample: Callable[[], _ResponseT],
+    gate: SuccessRateGate,
+    *,
+    request_num: int,
+    report: Callable[[str], None] = print,
+) -> list[_ResponseT]:
+    """Send ``request_num`` samples and gate on how many passed, returning the successes.
+
+    ``sample`` sends one request and asserts it. Only the sampled quality assertions are
+    counted; anything else propagates immediately. Does not retry and does not exit early,
+    since both would bias the rate being measured.
+    """
+    if gate.min_successes > request_num:
+        raise ValueError(f"min_successes={gate.min_successes} exceeds request_num={request_num}, gate can never pass")
+    concurrency = min(gate.concurrency or request_num, request_num)
+    responses: list[_ResponseT] = []
+    failures: list[str] = []
+    lock = threading.Lock()
+
+    def _one_sample(_: int) -> None:
+        try:
+            response = sample()
+        except AssertionError as exc:
+            if not is_quality_failure(exc):
+                raise
+            with lock:
+                failures.append(str(exc))
+            return
+        with lock:
+            responses.append(response)
+
+    for start in range(0, request_num, concurrency):
+        size = min(concurrency, request_num - start)
+        with ThreadPoolExecutor(max_workers=size) as executor:
+            for _ in executor.map(_one_sample, range(size)):
+                pass
+
+    successes = request_num - len(failures)
+    report(f"success rate: {successes}/{request_num} succeeded")
+    assert successes >= gate.min_successes, (
+        f"success rate {successes}/{request_num} is below the "
+        f"{gate.min_successes}/{request_num} gate "
+        f"(95% CI {wilson_interval(successes, request_num)}). Failures:\n"
+        + "\n".join(f"  - {failure}" for failure in failures)
+    )
+    return responses
 
 
 def wilson_interval(successes: int, total: int, z: float = 1.96) -> str:
@@ -446,7 +526,7 @@ def _assert_preset_voice_gender_from_audio(
     print(f"Preset voice gender check: preset={key!r}, estimated={estimated_gender!r}, expected={expected_gender!r}")
     if estimated_gender != "unknown":
         assert estimated_gender == expected_gender, (
-            f"{voice_name!r} is expected {expected_gender}, but estimated gender is {estimated_gender!r}"
+            f"{voice_name!r} is expected {expected_gender}, but {GENDER_MISMATCH_MESSAGE} {estimated_gender!r}"
         )
 
 
