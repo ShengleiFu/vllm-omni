@@ -13,6 +13,7 @@ from skip_ci import resolve_ci_decision  # noqa: E402
 from upload_pipeline import (  # noqa: E402
     _expand_mirror_hardwares,
     _load_bootstrap_steps,
+    _load_mirror_hardwares,
     _render_bootstrap_pipeline,
     _render_test_pipeline,
 )
@@ -140,6 +141,23 @@ def test_mirror_hardwares_a2b3_npu_4_expands_agents_image_and_plugins() -> None:
     assert step["plugins"][0]["kubernetes"]["podSpecPatch"]["imagePullSecrets"] == [
         {"name": "swr-secret"},
     ]
+
+
+def test_docker_presets_mount_the_buildkite_agent() -> None:
+    """The docker plugin leaves ``buildkite-agent`` off PATH inside the container.
+
+    Steps that call it -- artifact upload, annotate, meta-data -- then fail on
+    these presets only, which the kubernetes ones hide by providing the binary.
+    """
+    for name, preset in _load_mirror_hardwares().items():
+        for plugin in preset.get("plugins") or []:
+            if not isinstance(plugin, dict):
+                continue
+            for key, config in plugin.items():
+                if key.startswith("docker#"):
+                    assert config.get("mount-buildkite-agent") is True, (
+                        f"preset {name!r} uses the docker plugin without mount-buildkite-agent"
+                    )
 
 
 COVERAGE_PILOT_LABELS = ("Diffusion · Bagel Test", "TTS · Qwen3-TTS Base Test")

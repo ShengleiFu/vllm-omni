@@ -393,6 +393,12 @@ settings in `pyproject.toml`: online tests launch the server with
 `subprocess.Popen` and stop it with SIGTERM, and without those settings the XML
 reflects only the pytest parent process, not the server's code paths.
 
+The upload depends on `buildkite-agent` being callable inside the container. The
+`kubernetes` presets (`h100_*`, `*_npu_*`) provide it; the `docker` ones (`l4_*`)
+only do because they set `mount-buildkite-agent: true`, which
+`tests/buildkite/test_upload_pipeline.py` pins for every docker preset. A new
+preset that runs a coverage job needs the same.
+
 List both `run_cov_split.sh` and `pyproject.toml` in every opted-in job's
 `source_file_dependencies` — both change what the job measures, so without them a
 change there is filtered out of normal PR builds and only surfaces in a later

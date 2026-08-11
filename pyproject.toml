@@ -281,12 +281,19 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
+core = "sysmon"
+source = ["vllm_omni"]
 # Online-serving tests launch the server via subprocess.Popen and stop it with
 # SIGTERM. pytest-cov no longer instruments subprocesses implicitly, and a
-# SIGTERM-ed process discards its data, so without these two options a coverage
-# run over an online test measures only the pytest parent.
+# SIGTERM-ed process discards its data, so without patch/sigterm a coverage run
+# over an online test measures only the pytest parent.
 patch = ["subprocess"]
+concurrency = ["multiprocessing", "thread"]
 sigterm = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
 
 [tool.typos.default]
 extend-ignore-identifiers-re = [
