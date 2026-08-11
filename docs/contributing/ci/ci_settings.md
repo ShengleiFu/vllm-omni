@@ -395,9 +395,8 @@ reflects only the pytest parent process, not the server's code paths.
 
 The upload depends on `buildkite-agent` being callable inside the container. The
 `kubernetes` presets (`h100_*`, `*_npu_*`) provide it; the `docker` ones (`l4_*`)
-only do because they set `mount-buildkite-agent: true`, which
-`tests/buildkite/test_upload_pipeline.py` pins for every docker preset. A new
-preset that runs a coverage job needs the same.
+only do because they set `mount-buildkite-agent: true`. A new docker preset that
+runs a coverage job needs the same.
 
 List both `run_cov_split.sh` and `pyproject.toml` in every opted-in job's
 `source_file_dependencies` — both change what the job measures, so without them a
