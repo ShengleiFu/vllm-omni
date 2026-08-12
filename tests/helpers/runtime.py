@@ -44,6 +44,7 @@ from tests.helpers.assertions import (
     assert_images_generations_response,
     assert_omni_response,
 )
+from tests.helpers.deadline import build_with_cleanup, run_with_deadline
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.media import (
     _merge_base64_audio_to_segment,
@@ -56,6 +57,10 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+# Ample for a healthy teardown (the psutil sweep alone allows 8s); this only bounds
+# the pathological case where close() or destroy_process_group() never returns.
+TEARDOWN_DEADLINE_S = 180.0
 
 
 def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
@@ -2880,7 +2885,8 @@ class OmniRunner:
     def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
         return self.omni.stop_profile(stages=stages)
 
-    def _cleanup_process(self):
+    @staticmethod
+    def _cleanup_process():
         try:
             keywords = ["enginecore"]
             matched = []
@@ -2918,13 +2924,29 @@ class OmniRunner:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def _teardown(self) -> None:
         if hasattr(self.omni, "close"):
             self.omni.close()
         self._cleanup_process()
         run_pre_test_cleanup()
         run_post_test_cleanup()
         cleanup_dist_env_and_memory()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # close() and destroy_process_group() can both block indefinitely -- the latter
+        # waits on peer ranks a mid-init failure already killed. A fixture stuck in
+        # teardown reports no failure at all; the run dies on the CI step timeout instead.
+        run_with_deadline(self._teardown, TEARDOWN_DEADLINE_S, "OmniRunner teardown")
+
+
+def cleanup_after_failed_runner_init() -> None:
+    """Teardown for a runner whose constructor raised, so there is no instance to use.
+
+    Mirrors ``OmniRunner._teardown`` without the engine handle, which was never assigned.
+    """
+    OmniRunner._cleanup_process()
+    run_post_test_cleanup()
+    cleanup_dist_env_and_memory()
 
 
 class OmniRunnerHandler:
@@ -3237,7 +3259,16 @@ def iter_omni_runner(
         model = model_prefix + model
         if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
             model = resolve_tiny_model_path(model)
-        with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, **extra_omni_kwargs) as runner:
+        # Constructed before the ``with``, so a constructor failing part-way never reaches
+        # __exit__ and would abandon the engine subprocesses it already started -- which the
+        # interpreter then joins at exit, stalling the run with no failure reported.
+        runner = build_with_cleanup(
+            lambda: OmniRunner(model, seed=42, stage_configs_path=stage_config_path, **extra_omni_kwargs),
+            lambda: run_with_deadline(
+                cleanup_after_failed_runner_init, TEARDOWN_DEADLINE_S, "OmniRunner failed-init cleanup"
+            ),
+        )
+        with runner:
             print("OmniRunner started successfully")
             yield runner
             print("OmniRunner stopping...")
