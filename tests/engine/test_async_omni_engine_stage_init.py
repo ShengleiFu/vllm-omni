@@ -24,7 +24,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):
     engine = object.__new__(AsyncOmniEngine)
     engine.orchestrator_thread = types.SimpleNamespace(is_alive=lambda: True)
-    monkeypatch.setattr(engine, "_try_shutdown", lambda _message: None)
+    monkeypatch.setattr(engine, "_try_shutdown", lambda _message, **_kwargs: None)
 
     ticks = iter((0.0, 1.0))
     monkeypatch.setattr(async_omni_engine_module.time, "monotonic", lambda: next(ticks))

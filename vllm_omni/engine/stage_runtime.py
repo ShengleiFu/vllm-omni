@@ -9,6 +9,7 @@ import concurrent.futures
 import copy
 import os
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from typing import Any
 import janus
 from omegaconf import OmegaConf
 from vllm.logger import init_logger
+from vllm.v1.utils import shutdown as shutdown_procs
 
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
@@ -269,6 +271,59 @@ class StageRuntime:
         if self._stage_init_executor is not None:
             self._stage_init_executor.shutdown(wait=True, cancel_futures=True)
             self._stage_init_executor = None
+
+    def owned_processes(self) -> list[Any]:
+        """Subprocess handles this runtime's clients own, for bounded termination."""
+        procs: list[Any] = []
+        for pool in self.stage_pools:
+            for client in pool.clients:
+                if client is None:
+                    continue
+                for manager in (
+                    getattr(client, "_proc_manager", None),
+                    getattr(getattr(client, "resources", None), "engine_manager", None),
+                ):
+                    if manager is None:
+                        continue
+                    proc = getattr(manager, "proc", None)
+                    if proc is not None:
+                        procs.append(proc)
+                    procs.extend(getattr(manager, "processes", None) or [])
+        return procs
+
+    def shutdown_after_startup_failure(self, timeout: float) -> None:
+        """Tear down within ``timeout`` so the startup exception reaches the caller.
+
+        Deliberately skips ``client.shutdown()``: a client built only part-way can block
+        without a bound of its own -- the diffusion client ends in ``zmq_ctx.term()`` --
+        and graceful close buys nothing once initialization has already failed. Goes
+        straight to the processes those clients own instead, which vLLM's ``shutdown``
+        terminates, joins against the remaining budget, then kills by process tree.
+
+        Errors are logged rather than raised: this runs while a startup exception is
+        propagating, and that exception is the one worth reporting.
+        """
+        deadline = time.monotonic() + timeout
+        if self._stage_init_executor is not None:
+            # wait=False: a stage-init worker blocked on the very failure being handled
+            # must not hold the caller. cancel_futures drops the ones not yet started.
+            try:
+                self._stage_init_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                logger.warning("[StageRuntime] stage-init executor shutdown failed", exc_info=True)
+            self._stage_init_executor = None
+        try:
+            procs = self.owned_processes()
+        except Exception:
+            logger.warning("[StageRuntime] could not collect owned processes", exc_info=True)
+            return
+        if not procs:
+            return
+        logger.info("[StageRuntime] terminating %d owned process(es) after startup failure", len(procs))
+        try:
+            shutdown_procs(procs, timeout=max(0.0, deadline - time.monotonic()))
+        except Exception:
+            logger.warning("[StageRuntime] owned-process shutdown failed", exc_info=True)
 
     def create_membership_controller(self) -> Any | None:
         """Return a distributed membership controller, if this runtime needs one."""

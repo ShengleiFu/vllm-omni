@@ -84,6 +84,10 @@ if TYPE_CHECKING:
     from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 _STARTUP_POLL_INTERVAL_S = 1.0
+# Startup failure gets a tighter budget than a healthy teardown: the caller is holding an
+# exception that pytest (or a serving client) needs to see, and nothing here is worth
+# waiting minutes for once initialization has already failed.
+STARTUP_FAILURE_SHUTDOWN_TIMEOUT_S = 60.0
 _REQUEST_QUEUE_MAXSIZE = 256
 # ============================================================================
 # Parent-EngineArgs field-routing contracts (consumed by
@@ -488,7 +492,10 @@ class AsyncOmniEngine:
                     "--stage-init-timeout values.",
                     startup_timeout,
                 )
-                self._try_shutdown("[AsyncOmniEngine] Failed to cleanup after orchestrator startup timeout")
+                self._try_shutdown(
+                    "[AsyncOmniEngine] Failed to cleanup after orchestrator startup timeout",
+                    runtime_timeout=STARTUP_FAILURE_SHUTDOWN_TIMEOUT_S,
+                )
                 raise TimeoutError(f"Orchestrator did not become ready within {startup_timeout}s")
             try:
                 startup_future.result(
@@ -497,12 +504,18 @@ class AsyncOmniEngine:
                 break
             except concurrent.futures.TimeoutError:
                 if not self.orchestrator_thread.is_alive():
-                    self._try_shutdown("[AsyncOmniEngine] Failed to cleanup after orchestrator startup failure")
+                    self._try_shutdown(
+                        "[AsyncOmniEngine] Failed to cleanup after orchestrator startup failure",
+                        runtime_timeout=STARTUP_FAILURE_SHUTDOWN_TIMEOUT_S,
+                    )
                     if startup_future.done():
                         startup_future.result()  # re-raises the real exception
                     raise RuntimeError("Orchestrator thread died during startup")
             except Exception:
-                self._try_shutdown("[AsyncOmniEngine] Failed to cleanup after orchestrator startup failure")
+                self._try_shutdown(
+                    "[AsyncOmniEngine] Failed to cleanup after orchestrator startup failure",
+                    runtime_timeout=STARTUP_FAILURE_SHUTDOWN_TIMEOUT_S,
+                )
                 raise
 
     # ---- request helpers ----
@@ -1844,7 +1857,7 @@ class AsyncOmniEngine:
         """Whether the orchestrator thread is alive."""
         return bool(self.orchestrator_thread.is_alive())
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, runtime_timeout: float | None = None) -> None:
         """Send shutdown message and wait for the Orchestrator thread to exit."""
         if getattr(self, "_shutdown_called", False):
             return
@@ -1896,7 +1909,15 @@ class AsyncOmniEngine:
             except Exception:
                 pass
 
-        if hasattr(self, "_runtime") and self._runtime is not None and orchestrator_stopped:
+        if hasattr(self, "_runtime") and self._runtime is not None and runtime_timeout is not None:
+            # Startup failed: bound the teardown so the original exception reaches the
+            # caller. Deferring to a thread instead would let a late cleanup run against
+            # whatever engine is live by then.
+            try:
+                self._runtime.shutdown_after_startup_failure(runtime_timeout)
+            except Exception:
+                logger.exception("[AsyncOmniEngine] Failed to shutdown StageRuntime after startup failure")
+        elif hasattr(self, "_runtime") and self._runtime is not None and orchestrator_stopped:
             try:
                 self._runtime.shutdown()
             except Exception:
@@ -1934,8 +1955,8 @@ class AsyncOmniEngine:
         except Exception:
             pass
 
-    def _try_shutdown(self, *args, **kwargs) -> None:
+    def _try_shutdown(self, *args, runtime_timeout: float | None = None, **kwargs) -> None:
         try:
-            self.shutdown()
+            self.shutdown(runtime_timeout=runtime_timeout)
         except Exception:
             logger.exception(*args, **kwargs)
