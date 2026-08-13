@@ -335,12 +335,21 @@ Test" and "TTS · Qwen3-TTS Base Test". Both run on a single GPU so the pilot is
 cheap to reproduce. This is a pilot, not a rollout: no dashboard/visualization
 lives in this repo, and nothing is gated on coverage.
 
-**Naming convention**: `coverage-<model_id>-<mode>-<step_id>.xml`, where
+**Naming convention**: `coverage-<model_id>-<mode>-<step_id>.xml.gz`, where
 `<model_id>` is the model's directory name under
 `vllm_omni/diffusion/models/<model_id>/` or
 `vllm_omni/model_executor/models/<model_id>/` (e.g. `z_image`, `qwen3_omni`),
 `<mode>` is `online` or `offline`, and `<step_id>` is `BUILDKITE_STEP_ID`
-(`local` outside Buildkite).
+(`local` outside Buildkite). `gunzip` before feeding a report to a Cobertura
+consumer.
+
+Reports are gzipped because `--cov=vllm_omni` sets coverage's `source`, which
+makes it walk the package and emit one `<line>` element per statement for every
+file — including the ones a single model's tests never import. That inventory,
+not the coverage, is the size: a Bagel report is 7.1 MB, of which 96.5% is
+`<line>` elements and 77% belongs to the 840 of 1169 files that run never
+imported. A run covering zero lines produces the same 7 MB. gzip takes it to
+roughly 410 KB and changes nothing about the data.
 
 `<step_id>` is what keeps two steps that cover the same model apart. Artifacts are
 scoped to the build, and a nightly build carries the ready, merge and nightly tiers

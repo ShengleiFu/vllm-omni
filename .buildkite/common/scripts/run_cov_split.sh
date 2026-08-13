@@ -5,7 +5,7 @@
 # Usage: run_cov_split.sh --model-id <id> [--offline <paths>] [--online <paths>] \
 #                         -- <pytest args...>
 #
-#   --model-id  Names the artifacts: coverage-<id>-{offline,online}-<step id>.xml.
+#   --model-id  Names the artifacts: coverage-<id>-{offline,online}-<step id>.xml.gz.
 #               Use the model's directory name under vllm_omni/*/models/.
 #   --offline   Pytest path(s) for the offline half. Repeatable.
 #   --online    Pytest path(s) for the online half. Repeatable.
@@ -57,20 +57,26 @@ ONLINE_REPORT="coverage-${MODEL_ID}-online-${REPORT_SUFFIX}.xml"
 run_half() {
     local mode="$1"
     shift
+    local report="coverage-${MODEL_ID}-${mode}-${REPORT_SUFFIX}.xml"
     echo "--- coverage: ${MODEL_ID} ${mode}"
-    pytest -s -v "$@" "${PYTEST_ARGS[@]}" \
-        --cov=vllm_omni --cov-report="xml:coverage-${MODEL_ID}-${mode}-${REPORT_SUFFIX}.xml"
+    pytest -s -v "$@" "${PYTEST_ARGS[@]}" --cov=vllm_omni --cov-report="xml:${report}"
+    local status=$?
+    # Cobertura lists every statement in vllm_omni whether or not it ran, so the
+    # report is ~7MB no matter how little the job covers. The repetition is what
+    # dominates it, and gzip takes that to ~400KB.
+    gzip -9 -f "${report}" || status=1
+    return "${status}"
 }
 
 # Clear both modes, not just the ones being run: the upload glob matches both, so
 # a report left by an earlier run would otherwise be published as if the mode it
 # belongs to had run this time.
-rm -f "${OFFLINE_REPORT}" "${ONLINE_REPORT}"
+rm -f "${OFFLINE_REPORT}" "${ONLINE_REPORT}" "${OFFLINE_REPORT}.gz" "${ONLINE_REPORT}.gz"
 
 EXIT=0
 ((${#OFFLINE[@]})) && { run_half offline "${OFFLINE[@]}" || EXIT=1; }
 ((${#ONLINE[@]})) && { run_half online "${ONLINE[@]}" || EXIT=1; }
 
-buildkite-agent artifact upload "coverage-${MODEL_ID}-*-${REPORT_SUFFIX}.xml" || EXIT=1
+buildkite-agent artifact upload "coverage-${MODEL_ID}-*-${REPORT_SUFFIX}.xml.gz" || EXIT=1
 
 exit "${EXIT}"
