@@ -678,9 +678,9 @@ def _select_whisper_device() -> str:
     if current_omni_platform.is_available():
         n = current_omni_platform.get_device_count()
         # Single-GPU runners (e.g. the L4 nightly): the model server already
-        # occupies device 0. Loading Whisper there, once per concurrent
-        # request, competes for VRAM and OOMs. Only borrow an accelerator
-        # when a spare device exists; otherwise validate on CPU.
+        # occupies device 0, and a Whisper model resident there competes with
+        # it for VRAM and OOMs. Only borrow an accelerator when a spare device
+        # exists; otherwise validate on CPU.
         if n > 1:
             device_index = n - 1
 
@@ -702,7 +702,8 @@ def _get_whisper_model(model_size: str) -> Any:
         import whisper
 
         # The device is picked on first load and the model stays on it for the
-        # worker's lifetime, which spans every transcription in a test module.
+        # worker's lifetime: the current server or runner fixture instance, or
+        # the test module for callers that transcribe without those fixtures.
         device = _select_whisper_device()
         with _serialize_whisper_model_download(model_size):
             model = whisper.load_model(model_size, device=device)

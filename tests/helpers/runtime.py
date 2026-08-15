@@ -3129,6 +3129,11 @@ def iter_omni_server(
     from tests.helpers.stage_config import stage_config_path_for_run_level
 
     with omni_fixture_lock:
+        # No server or runner starts while a Whisper worker still holds the
+        # device. Normally a no-op -- the previous instance released on its way
+        # out -- but a module whose earlier test transcribed directly, without
+        # this fixture, would otherwise reach here with the worker still up.
+        release_audio_transcriber()
         params: OmniServerParams = request.param
         # For now, when a tiny model is substituted, we preserve the original model
         # name via --served-model-name (so that the server still accepts requests with
@@ -3226,6 +3231,7 @@ def iter_omni_runner(
     from tests.helpers.stage_config import stage_config_path_for_run_level
 
     with omni_fixture_lock:
+        release_audio_transcriber()
         param = request.param
         if not isinstance(param, (tuple, list)) or len(param) not in (2, 3):
             raise ValueError(
