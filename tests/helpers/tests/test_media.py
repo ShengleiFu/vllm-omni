@@ -82,8 +82,10 @@ def _patch_executors(monkeypatch, outcomes_per_executor=()) -> list[_FakeExecuto
     def factory(*args, **kwargs):
         index = len(created)
         outcomes = outcomes_per_executor[index] if index < len(outcomes_per_executor) else ()
-        created.append(_FakeExecutor(outcomes))
-        return created[-1]
+        executor = _FakeExecutor(outcomes)
+        executor.init_kwargs = kwargs
+        created.append(executor)
+        return executor
 
     monkeypatch.setattr(media.concurrent.futures, "ProcessPoolExecutor", factory)
     return created
@@ -186,6 +188,53 @@ def test_broken_pool_is_discarded_and_retried_once(monkeypatch):
     assert len(created) == 2
     assert created[0].shutdown_calls == 1
     assert len(created[1].submitted) == 1
+
+
+def test_worker_pool_is_a_single_spawned_process(monkeypatch):
+    """Both constructor arguments are load-bearing.
+
+    ``max_workers=1`` is what keeps the worker-side model cache to one copy, and
+    ``spawn`` is what keeps a forked accelerator context out of the worker.
+    """
+    created = _patch_executors(monkeypatch)
+
+    media.convert_audio_file_to_text("/tmp/a.wav")
+
+    assert created[0].init_kwargs["max_workers"] == 1
+    assert created[0].init_kwargs["mp_context"].get_start_method() == "spawn"
+
+
+def test_replacement_pool_failure_also_discards(monkeypatch):
+    """The retry is one attempt, and neither dead pool may be left installed."""
+    created = _patch_executors(
+        monkeypatch,
+        outcomes_per_executor=([BrokenProcessPool("first")], [BrokenProcessPool("second")]),
+    )
+
+    with pytest.raises(BrokenProcessPool):
+        media.convert_audio_file_to_text("/tmp/a.wav")
+
+    assert len(created) == 2
+    assert created[0].shutdown_calls == 1
+    assert created[1].shutdown_calls == 1
+    assert media._TRANSCRIBER is None
+
+
+def test_transcription_error_propagates_and_keeps_the_worker(monkeypatch):
+    """A failure raised *by* the transcription is not a dead worker.
+
+    A ``torch`` OOM arrives here as the task's own exception, not as
+    ``BrokenProcessPool``, and the caller sees it exactly as it did when every
+    transcription had its own process. The worker stays installed.
+    """
+    created = _patch_executors(monkeypatch, outcomes_per_executor=([RuntimeError("CUDA out of memory")],))
+
+    with pytest.raises(RuntimeError, match="CUDA out of memory"):
+        media.convert_audio_file_to_text("/tmp/a.wav")
+
+    assert len(created) == 1
+    assert created[0].shutdown_calls == 0
+    assert media._TRANSCRIBER is created[0]
 
 
 def test_late_failure_does_not_discard_the_replacement_pool(monkeypatch):

@@ -48,6 +48,7 @@ from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.media import (
     _merge_base64_audio_to_segment,
     decode_b64_image,
+    release_audio_transcriber,
 )
 from tests.model_tests.diffusion.utils import resolve_tiny_model_path
 from vllm_omni.config.stage_config import resolve_deploy_yaml
@@ -3175,7 +3176,13 @@ def iter_omni_server(
                 if model != original_model:
                     server.model = original_model
                 print("OmniServer started successfully")
-                yield server
+                try:
+                    yield server
+                finally:
+                    # This fixture is parametrized, so the next instance may start
+                    # inside the same module. Free the Whisper judge's device
+                    # memory before that server initializes its own model.
+                    release_audio_transcriber()
                 print("OmniServer stopping...")
         else:
             if stage_config_path is not None:
@@ -3200,7 +3207,10 @@ def iter_omni_server(
                 if model != original_model:
                     server.model = original_model
                 print("OmniServer started successfully")
-                yield server
+                try:
+                    yield server
+                finally:
+                    release_audio_transcriber()
                 print("OmniServer stopping...")
 
         print("OmniServer stopped")
@@ -3234,7 +3244,10 @@ def iter_omni_runner(
             model = resolve_tiny_model_path(model)
         with OmniRunner(model, seed=42, deploy_config=stage_config_path, **extra_omni_kwargs) as runner:
             print("OmniRunner started successfully")
-            yield runner
+            try:
+                yield runner
+            finally:
+                release_audio_transcriber()
             print("OmniRunner stopping...")
 
         print("OmniRunner stopped")

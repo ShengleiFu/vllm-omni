@@ -756,11 +756,12 @@ def _discard_transcriber(executor: concurrent.futures.ProcessPoolExecutor) -> No
 
 
 def release_audio_transcriber() -> None:
-    """Shut the transcription worker down, freeing the device memory its model holds.
+    """Shut the transcription worker down, freeing the device memory its models hold.
 
-    Called at test-module teardown so a Whisper model does not stay resident
-    while a later module starts a server. Tests that need the accelerator back
-    sooner can call this directly.
+    Called when a server or runner fixture instance tears down, so that the next
+    one -- including the next parametrization inside the same test module -- does
+    not initialize its model while Whisper still occupies the device. A module
+    teardown fixture repeats it for tests that transcribe without those fixtures.
     """
     global _TRANSCRIBER
     with _TRANSCRIBER_LOCK:
@@ -773,18 +774,25 @@ def convert_audio_file_to_text(output_path: str, model_size: str = "small", lang
     """Convert an audio file to text in a reused, isolated subprocess.
 
     The worker outlives the call so its Whisper model is loaded once rather than
-    once per transcription. ``max_workers=1`` consequently serializes concurrent
-    callers, which is what keeps resident Whisper memory at a single model.
+    once per transcription, and ``max_workers=1`` serializes concurrent callers
+    onto it. The worker caches one model per size it is asked for, so a run that
+    escalates to a stronger ASR keeps both models resident until release.
+
+    Only the death of the worker process is recovered from here: that breaks the
+    pool for every later caller, so it is replaced and the call retried once. An
+    exception raised *by* the transcription, a ``torch`` OOM included, is
+    propagated to the caller with the worker left intact -- same as the caller
+    saw when each transcription had its own process.
     """
-    executor = _get_transcriber()
-    try:
-        return executor.submit(_whisper_transcribe_in_current_process, output_path, model_size, language).result()
-    except BrokenProcessPool:
-        # A dead worker (an OOM, typically) poisons the pool for every later
-        # caller, so drop it and give this call one fresh worker.
-        _discard_transcriber(executor)
+    for attempt in range(2):
         executor = _get_transcriber()
-        return executor.submit(_whisper_transcribe_in_current_process, output_path, model_size, language).result()
+        try:
+            return executor.submit(_whisper_transcribe_in_current_process, output_path, model_size, language).result()
+        except BrokenProcessPool:
+            _discard_transcriber(executor)
+            if attempt == 1:
+                raise
+    raise AssertionError("unreachable")
 
 
 def convert_audio_bytes_to_text(raw_bytes: bytes, model_size: str = "small", language: str | None = None) -> str:
