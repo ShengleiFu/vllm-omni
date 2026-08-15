@@ -18,6 +18,7 @@ from tests.model_executor.helpers import bootstrap_vllm_layer_custom_op_modules
 bootstrap_vllm_layer_custom_op_modules()
 
 pytest_plugins = (
+    "tests.helpers.fixtures.audio_transcriber",
     "tests.helpers.fixtures.config",
     "tests.helpers.fixtures.env",
     "tests.helpers.fixtures.log",
