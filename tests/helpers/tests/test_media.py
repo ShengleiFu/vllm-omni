@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import sys
+import threading
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -220,21 +221,82 @@ def test_replacement_pool_failure_also_discards(monkeypatch):
     assert media._TRANSCRIBER is None
 
 
-def test_transcription_error_propagates_and_keeps_the_worker(monkeypatch):
-    """A failure raised *by* the transcription is not a dead worker.
+def test_transcription_error_propagates_and_discards_the_worker(monkeypatch):
+    """A task failure (e.g. a torch OOM) propagates AND tears the worker down.
 
-    A ``torch`` OOM arrives here as the task's own exception, not as
-    ``BrokenProcessPool``, and the caller sees it exactly as it did when every
-    transcription had its own process. The worker stays installed.
+    It arrives as the task's own exception, not ``BrokenProcessPool``, but the
+    worker -- and its resident model -- is still discarded, restoring the old
+    one-process-per-call isolation. The exception is not retried; the next call
+    builds a fresh worker.
     """
     created = _patch_executors(monkeypatch, outcomes_per_executor=([RuntimeError("CUDA out of memory")],))
 
     with pytest.raises(RuntimeError, match="CUDA out of memory"):
         media.convert_audio_file_to_text("/tmp/a.wav")
 
+    assert len(created) == 1  # not retried
+    assert created[0].shutdown_calls == 1
+    assert media._TRANSCRIBER is None
+
+    assert media.convert_audio_file_to_text("/tmp/b.wav") == "London"
+    assert len(created) == 2  # a fresh worker for the next call
+
+
+def test_concurrent_callers_serialize_onto_one_worker(monkeypatch):
+    """The call lock keeps a second caller from starting while the first is in flight.
+
+    That is what makes discard-on-failure safe: a failing call can tear its
+    worker down knowing no other caller has a future queued on it.
+    """
+    first_in_flight = threading.Event()
+    let_first_finish = threading.Event()
+    created: list = []
+
+    class CoordinatedExecutor:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def submit(self, fn, *args):
+            is_first = created.index(self) == 0 and not first_in_flight.is_set()
+
+            def _result():
+                if is_first:
+                    first_in_flight.set()
+                    assert let_first_finish.wait(timeout=5)
+                return "London"
+
+            return SimpleNamespace(result=_result)
+
+        def shutdown(self, wait=True):
+            self.shutdown_calls += 1
+
+    def factory(*args, **kwargs):
+        created.append(CoordinatedExecutor())
+        return created[-1]
+
+    monkeypatch.setattr(media.concurrent.futures, "ProcessPoolExecutor", factory)
+
+    results: dict[str, str] = {}
+
+    def call(key):
+        results[key] = media.convert_audio_file_to_text(f"/tmp/{key}.wav")
+
+    a = threading.Thread(target=call, args=("a",))
+    a.start()
+    assert first_in_flight.wait(timeout=5)  # A is mid-transcription, holding the call lock
+
+    b = threading.Thread(target=call, args=("b",))
+    b.start()
+    b.join(timeout=0.5)
+    assert b.is_alive()  # B is blocked on the call lock, has not started a second worker
     assert len(created) == 1
-    assert created[0].shutdown_calls == 0
-    assert media._TRANSCRIBER is created[0]
+
+    let_first_finish.set()
+    a.join(timeout=5)
+    b.join(timeout=5)
+    assert not a.is_alive() and not b.is_alive()
+    assert results == {"a": "London", "b": "London"}
+    assert len(created) == 1  # B reused A's worker
 
 
 def test_late_failure_does_not_discard_the_replacement_pool(monkeypatch):

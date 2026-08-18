@@ -727,6 +727,12 @@ def _whisper_transcribe_in_current_process(
     return text or ""
 
 
+# Serializes a whole submit->result->cleanup on the parent side, so at most one
+# call is ever in flight on the single-worker pool. The child already runs
+# transcriptions serially, so this costs no throughput; it lets a failed call
+# discard the worker without disrupting another caller's in-flight future.
+_TRANSCRIBER_CALL_LOCK = threading.Lock()
+# Guards the _TRANSCRIBER pointer itself.
 _TRANSCRIBER_LOCK = threading.Lock()
 _TRANSCRIBER: concurrent.futures.ProcessPoolExecutor | None = None
 
@@ -743,9 +749,8 @@ def _get_transcriber() -> concurrent.futures.ProcessPoolExecutor:
 def _discard_transcriber(executor: concurrent.futures.ProcessPoolExecutor) -> None:
     """Drop ``executor``, but only while it is still the current one.
 
-    Concurrent callers share the worker and so all observe the same crash. An
-    unconditional teardown here would let a late report shut down the
-    replacement worker an earlier caller already installed.
+    Identity-checked so a stale reference can never shut down a newer worker that
+    was installed after ``executor`` was replaced.
     """
     global _TRANSCRIBER
     with _TRANSCRIBER_LOCK:
@@ -763,35 +768,49 @@ def release_audio_transcriber() -> None:
     one -- including the next parametrization inside the same test module -- does
     not initialize its model while Whisper still occupies the device. A module
     teardown fixture repeats it for tests that transcribe without those fixtures.
+
+    Takes the call lock, so it waits for any in-flight transcription to finish
+    rather than shutting the worker down underneath it.
     """
     global _TRANSCRIBER
-    with _TRANSCRIBER_LOCK:
-        executor, _TRANSCRIBER = _TRANSCRIBER, None
-    if executor is not None:
-        executor.shutdown(wait=True)
+    with _TRANSCRIBER_CALL_LOCK:
+        with _TRANSCRIBER_LOCK:
+            executor, _TRANSCRIBER = _TRANSCRIBER, None
+        if executor is not None:
+            executor.shutdown(wait=True)
 
 
 def convert_audio_file_to_text(output_path: str, model_size: str = "small", language: str | None = None) -> str:
     """Convert an audio file to text in a reused, isolated subprocess.
 
     The worker outlives the call so its Whisper model is loaded once rather than
-    once per transcription, and ``max_workers=1`` serializes concurrent callers
-    onto it. The worker caches one model per size it is asked for, so a run that
-    escalates to a stronger ASR keeps both models resident until release.
+    once per transcription. The call lock serializes callers onto the single
+    worker (the child already transcribes serially, so this costs no throughput),
+    which lets a failed call tear the worker down without racing another caller.
+    The worker caches one model per size it is asked for, so a run that escalates
+    to a stronger ASR keeps both models resident until release.
 
-    Only the death of the worker process is recovered from here: that breaks the
-    pool for every later caller, so it is replaced and the call retried once. An
-    exception raised *by* the transcription, a ``torch`` OOM included, is
-    propagated to the caller with the worker left intact -- same as the caller
-    saw when each transcription had its own process.
+    Any failure discards the worker, restoring the failure isolation of the old
+    one-process-per-call design: a task exception (a ``torch`` OOM included)
+    propagates unchanged after the worker -- and its resident model -- is torn
+    down, and a dead worker (``BrokenProcessPool``) is additionally retried once.
     """
-    for attempt in range(2):
-        executor = _get_transcriber()
-        try:
-            return executor.submit(_whisper_transcribe_in_current_process, output_path, model_size, language).result()
-        except BrokenProcessPool:
-            _discard_transcriber(executor)
-            if attempt == 1:
+    with _TRANSCRIBER_CALL_LOCK:
+        for attempt in range(2):
+            executor = _get_transcriber()
+            try:
+                return executor.submit(
+                    _whisper_transcribe_in_current_process, output_path, model_size, language
+                ).result()
+            except BrokenProcessPool:
+                _discard_transcriber(executor)
+                if attempt == 1:
+                    raise
+            except Exception:
+                # A task-level failure (e.g. a torch OOM) leaves the worker and
+                # its model resident; drop it so the failure cannot contaminate
+                # later calls, matching the old per-call teardown. Do not retry.
+                _discard_transcriber(executor)
                 raise
     raise AssertionError("unreachable")
 
