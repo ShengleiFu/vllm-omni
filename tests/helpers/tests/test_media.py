@@ -211,17 +211,23 @@ def test_broken_pool_is_discarded_and_retried_once(monkeypatch, second_outcome, 
     assert created[0].shutdown_calls == 1
 
 
-def test_transcription_error_propagates_and_discards_the_worker(monkeypatch):
-    """A task failure (e.g. a torch OOM) propagates AND tears the worker down.
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("CUDA out of memory"), KeyboardInterrupt()],
+    ids=["Exception", "BaseException"],
+)
+def test_transcription_failure_propagates_and_discards_the_worker(monkeypatch, error):
+    """Any failure -- an Exception or a BaseException like KeyboardInterrupt --
+    propagates AND tears the worker down.
 
     It arrives as the task's own exception, not ``BrokenProcessPool``, but the
     worker -- and its resident model -- is still discarded, restoring the old
-    one-process-per-call isolation. The exception is not retried; the next call
-    builds a fresh worker.
+    one-process-per-call isolation. It is not retried; the next call builds a
+    fresh worker.
     """
-    created = _patch_executors(monkeypatch, outcomes_per_executor=([RuntimeError("CUDA out of memory")],))
+    created = _patch_executors(monkeypatch, outcomes_per_executor=([error],))
 
-    with pytest.raises(RuntimeError, match="CUDA out of memory"):
+    with pytest.raises(type(error)):
         media.convert_audio_file_to_text("/tmp/a.wav")
 
     assert len(created) == 1  # not retried

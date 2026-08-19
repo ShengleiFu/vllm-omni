@@ -791,9 +791,11 @@ def convert_audio_file_to_text(output_path: str, model_size: str = "small", lang
     to a stronger ASR keeps both models resident until release.
 
     Any failure discards the worker, restoring the failure isolation of the old
-    one-process-per-call design: a task exception (a ``torch`` OOM included)
-    propagates unchanged after the worker -- and its resident model -- is torn
-    down, and a dead worker (``BrokenProcessPool``) is additionally retried once.
+    one-process-per-call design: a failure (a ``torch`` OOM, or a
+    ``KeyboardInterrupt``/``SystemExit`` transported through the future or
+    raised while ``result()`` blocks) propagates unchanged after the worker --
+    and its resident model -- is torn down, and a dead worker
+    (``BrokenProcessPool``) is additionally retried once.
     """
     with _TRANSCRIBER_CALL_LOCK:
         for attempt in range(2):
@@ -806,10 +808,12 @@ def convert_audio_file_to_text(output_path: str, model_size: str = "small", lang
                 _discard_transcriber(executor)
                 if attempt == 1:
                     raise
-            except Exception:
-                # A task-level failure (e.g. a torch OOM) leaves the worker and
-                # its model resident; drop it so the failure cannot contaminate
-                # later calls, matching the old per-call teardown. Do not retry.
+            except BaseException:
+                # Any other failure -- a task exception (a torch OOM included), or
+                # a KeyboardInterrupt/SystemExit transported through the future or
+                # interrupting result() -- leaves the worker and its model
+                # resident; drop it so it cannot contaminate later calls, matching
+                # the old per-call teardown. Do not retry.
                 _discard_transcriber(executor)
                 raise
     raise AssertionError("unreachable")
