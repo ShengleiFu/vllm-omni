@@ -50,7 +50,7 @@ from vllm_omni.diffusion.models.boogu_image.scheduling_flow_match_euler_discrete
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = init_logger(__name__)
@@ -100,6 +100,21 @@ def get_boogu_image_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
+def _boogu_batch_compatibility_key(has_reference: bool, request_id: str) -> tuple:
+    """Request-batch isolation key consumed by the scheduler.
+
+    ``forward`` derives a single ``task_type`` for the whole batch, so t2i and
+    ti2i requests must not share one. t2i requests get a stable key and batch
+    together. ti2i (edit) requests go through the reference-image path, whose
+    transformer batch handling is not yet cross-request safe (a batched edit
+    leaks its batch-mate's reference image), so each ti2i request gets a
+    request-unique key and effectively runs at batch=1.
+    """
+    if not has_reference:
+        return ("boogu_image", "t2i")
+    return ("boogu_image", "ti2i", request_id)
+
+
 def get_boogu_image_pre_process_func(od_config: OmniDiffusionConfig):
     """Build the pre-process callable for Boogu-Image reference (edit) input.
 
@@ -130,13 +145,15 @@ def get_boogu_image_pre_process_func(od_config: OmniDiffusionConfig):
     def pre_process_func(request: OmniDiffusionRequest):
         prompt = request.prompt
         if isinstance(prompt, str):
-            # Plain-text prompt cannot carry an image -> text-to-image, no-op.
+            # Plain-text prompt cannot carry an image -> text-to-image.
+            request.batch_compatibility_key = _boogu_batch_compatibility_key(False, request.request_id)
             return request
 
         multi_modal_data = prompt.get("multi_modal_data") or {}
         raw_image = multi_modal_data.get("image")
         if not raw_image:
-            # No reference image -> text-to-image, no-op (Base checkpoint).
+            # No reference image -> text-to-image (Base checkpoint).
+            request.batch_compatibility_key = _boogu_batch_compatibility_key(False, request.request_id)
             return request
 
         if isinstance(raw_image, list):
@@ -171,6 +188,7 @@ def get_boogu_image_pre_process_func(od_config: OmniDiffusionConfig):
         prompt["additional_information"]["preprocessed_image"] = preprocessed_image
         prompt["additional_information"]["prompt_image"] = prompt_image
         request.prompt = prompt
+        request.batch_compatibility_key = _boogu_batch_compatibility_key(True, request.request_id)
         return request
 
     return pre_process_func
@@ -198,7 +216,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
     transformer's reference-image refiner path.
     """
 
-    supports_request_batch = False
+    supports_request_batch = True
 
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
@@ -424,8 +442,11 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             embeds = embeds.repeat(1, num_images_per_prompt, 1)
             reshaped_embeds = embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
 
-        mask = mask.repeat(num_images_per_prompt, 1)
-        reshaped_mask = mask.view(batch_size * num_images_per_prompt, -1)
+        # repeat_interleave (not repeat/tile) so mask rows stay request-major
+        # [p0, p0, p1, p1] to match the reshaped embeds above; a plain repeat
+        # tiles to [p0, p1, p0, p1] and mismatches when batch_size > 1 and
+        # num_images_per_prompt > 1.
+        reshaped_mask = mask.repeat_interleave(num_images_per_prompt, dim=0)
 
         return batch_size, seq_len, reshaped_embeds, reshaped_mask
 
@@ -581,7 +602,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         preprocessed_images: list[torch.Tensor | None],
         num_images_per_prompt: int,
         device: torch.device,
-        generator=None,
+        generators: list[torch.Generator | None] | None = None,
     ) -> list[list[torch.Tensor] | None]:
         """VAE-encode per-sample reference images into the transformer's format.
 
@@ -590,17 +611,18 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         ``None`` (no reference / text-to-image) or a list of ``[C, H, W]``
         reference latents (one per reference image). Boogu editing uses a single
         reference image, so each non-empty entry is a one-element list.
-        """
-        # ``latent_dist.sample`` accepts only a single generator; a per-output
-        # generator list (num_outputs_per_prompt > 1) falls back to unseeded.
-        vae_generator = generator if isinstance(generator, torch.Generator) else None
 
+        ``generators`` holds one generator (or ``None``) per request, so each
+        reference latent is sampled with its own request's seed and batched
+        edits stay reproducible against the single-request path.
+        """
         ref_latents: list[list[torch.Tensor] | None] = []
-        for image in preprocessed_images:
+        for idx, image in enumerate(preprocessed_images):
             if image is None:
                 sample_latents: list[torch.Tensor] | None = None
             else:
-                latent = self._encode_vae_image(image.to(device=device), generator=vae_generator).squeeze(0)
+                generator = generators[idx] if generators is not None else None
+                latent = self._encode_vae_image(image.to(device=device), generator=generator).squeeze(0)
                 sample_latents = [latent]
             for _ in range(num_images_per_prompt):
                 ref_latents.append(sample_latents)
@@ -628,7 +650,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             preprocessed_images.append(ai.get("preprocessed_image"))
         return prompt_images, preprocessed_images
 
-    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         # Prompt / negative-prompt extraction (mirrors the Ovis pattern; the
         # online API sometimes passes ``{"negative_prompt": None}``).
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
@@ -642,7 +664,21 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         has_reference = any(img is not None for img in preprocessed_images)
         task_type = "ti2i" if has_reference else "t2i"
 
-        sp = req.sampling_params
+        # Fail-closed: the reference-image (edit) path is not yet cross-request
+        # safe under batching. batch_compatibility_key gives every ti2i request a
+        # unique key so the scheduler runs edits at batch=1; this guards against a
+        # regression that lets a batched edit slip through.
+        if has_reference and req.num_reqs > 1:
+            raise RuntimeError(
+                f"BooguImagePipeline received a batched TI2I (edit) request (num_reqs={req.num_reqs}); "
+                "the reference-image path is not cross-request safe. Edit requests must run at batch=1."
+            )
+
+        sampling_params_list = req.sampling_params_list
+        # Shared shape/step/guidance fields are guaranteed identical across the
+        # batch by RequestBatchSamplingParamsKey; request-local values (seeds,
+        # reference generators) are read per request below.
+        sp = sampling_params_list[0]
         device = self._execution_device
 
         height = sp.height or self.default_sample_size * self.vae_scale_factor
@@ -657,7 +693,15 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         if not has_reference:
             image_guidance_scale = 1.0
         num_images_per_prompt = sp.num_outputs_per_prompt if sp.num_outputs_per_prompt > 0 else 1
-        generator = sp.generator
+        # Per-request noise generators, collated into one flat list of length
+        # batch_size * num_images_per_prompt (request-major, output-minor).
+        generator = req.collate_request_generators(num_images_per_prompt, None)
+        # One generator per request for reference-latent sampling; a per-output
+        # generator list is not usable by ``latent_dist.sample`` and falls back
+        # to unseeded, matching the single-request path.
+        ref_generators = [
+            s.generator if isinstance(s.generator, torch.Generator) else None for s in sampling_params_list
+        ]
         max_sequence_length = sp.max_sequence_length or 1280
         output_type = sp.output_type or "pil"
         cfg_range = (0.0, 1.0)
@@ -698,7 +742,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         latent_channels = self.transformer.in_channels
         ref_latents = None
         if has_reference:
-            ref_latents = self._build_ref_latents(preprocessed_images, num_images_per_prompt, device, generator)
+            ref_latents = self._build_ref_latents(preprocessed_images, num_images_per_prompt, device, ref_generators)
 
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
@@ -803,4 +847,8 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             if (ori_height, ori_width) != (height, width):
                 image = F.interpolate(image, size=(ori_height, ori_width), mode="bilinear")
 
-        return DiffusionOutput(output=image)
+        return split_diffusion_output_by_request(
+            DiffusionOutput(output=image),
+            req,
+            num_outputs_per_prompt=num_images_per_prompt,
+        )

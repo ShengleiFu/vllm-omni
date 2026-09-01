@@ -501,11 +501,25 @@ def _make_forward_pipeline():
     return pipeline
 
 
-def _make_request_batch(prompt, **sampling_overrides):
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+def _wrap_request_batch(items):
+    """Wrap ``(prompt, sampling_params)`` pairs in a real DiffusionRequestBatch.
 
-    sampling = OmniDiffusionSamplingParams(**sampling_overrides)
-    return SimpleNamespace(prompts=[prompt], sampling_params=sampling)
+    The pipeline's request-batch ``forward`` reads ``sampling_params_list`` and
+    ``collate_request_generators``, so the fake single-namespace shim no longer
+    satisfies the contract; construct the genuine wrapper instead.
+    """
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+
+    requests = [
+        OmniDiffusionRequest(prompt=prompt, sampling_params=sampling, request_id=f"req-{i}")
+        for i, (prompt, sampling) in enumerate(items)
+    ]
+    return DiffusionRequestBatch(requests=requests)
+
+
+def _make_request_batch(prompt, **sampling_overrides):
+    return _wrap_request_batch([(prompt, _sampling(**sampling_overrides))])
 
 
 def test_forward_returns_diffusion_output():
@@ -514,8 +528,11 @@ def test_forward_returns_diffusion_output():
     pipeline = _make_forward_pipeline()
     req = _make_request_batch("a cat", height=64, width=64, num_inference_steps=2)
 
-    out = pipeline.forward(req)
+    outs = pipeline.forward(req)
 
+    # Request-batch forward returns one DiffusionOutput per request.
+    assert isinstance(outs, list) and len(outs) == 1
+    out = outs[0]
     assert isinstance(out, DiffusionOutput)
     assert isinstance(out.output, torch.Tensor)
     assert out.output.shape[0] == 1
@@ -851,7 +868,7 @@ def _make_edit_request(**sampling_overrides):
         },
     }
     sampling = _sampling(**sampling_overrides)
-    return SimpleNamespace(prompts=[prompt], sampling_params=sampling)
+    return _wrap_request_batch([(prompt, sampling)])
 
 
 def _sampling(**overrides):
@@ -937,10 +954,217 @@ def test_forward_image_guidance_ignored_without_reference():
     sampling = _sampling(height=64, width=64, num_inference_steps=num_steps, guidance_scale=5.0, guidance_scale_2=2.0)
     sampling.guidance_scale_provided = True
     sampling.guidance_scale_2_provided = True
-    req = SimpleNamespace(prompts=[{"prompt": "a cat"}], sampling_params=sampling)
+    req = _wrap_request_batch([({"prompt": "a cat"}, sampling)])
 
     pipeline.forward(req)
 
     # t2i text CFG: cond + uncond -> 2 predictions/step, no ref anywhere.
     assert _count_per_step(pipeline.transformer.calls, num_steps) == 2
     assert all(ref is None for ref in pipeline.transformer.calls)
+
+
+# ---------------------------------------------------------------------------
+# Request-batch: compatibility key, generator routing, output split
+# ---------------------------------------------------------------------------
+
+
+def test_boogu_batch_compatibility_key_t2i_stable_ti2i_unique():
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import _boogu_batch_compatibility_key
+
+    # t2i: request_id does not enter the key -> t2i requests batch together.
+    assert _boogu_batch_compatibility_key(False, "req-a") == _boogu_batch_compatibility_key(False, "req-b")
+    assert _boogu_batch_compatibility_key(False, "req-a")[1] == "t2i"
+
+    # ti2i (edit): request_id is in the key -> every edit gets a unique key and
+    # the scheduler never co-batches edits (reference path not cross-request safe).
+    assert _boogu_batch_compatibility_key(True, "req-a") != _boogu_batch_compatibility_key(True, "req-b")
+    assert _boogu_batch_compatibility_key(True, "req-a")[1] == "ti2i"
+
+    # t2i and ti2i never share a key.
+    assert _boogu_batch_compatibility_key(False, "req-a") != _boogu_batch_compatibility_key(True, "req-a")
+
+
+def test_pre_process_key_wiring_t2i_batches_ti2i_isolated(tmp_path):
+    # End-to-end: real pre-process sets request.batch_compatibility_key, and the
+    # scheduler's key builder reads it into condition_key. Two t2i requests share
+    # a key (co-batchable); two edit requests get distinct keys (batch=1).
+    import PIL.Image
+
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import get_boogu_image_pre_process_func
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    pre = get_boogu_image_pre_process_func(_make_edit_od_config(tmp_path))
+
+    def condition_key(prompt, rid):
+        req = OmniDiffusionRequest(
+            prompt=prompt, sampling_params=OmniDiffusionSamplingParams(height=512, width=512), request_id=rid
+        )
+        pre(req)
+        return build_request_batch_sampling_params_key(req).condition_key
+
+    t2i_a = condition_key({"prompt": "a cat"}, "t-a")
+    t2i_b = condition_key({"prompt": "a dog"}, "t-b")
+    assert t2i_a == t2i_b and t2i_a[1] == "t2i"
+
+    img = PIL.Image.new("RGB", (64, 64))
+    ti2i_a = condition_key({"prompt": "edit", "multi_modal_data": {"image": img}}, "e-a")
+    ti2i_b = condition_key({"prompt": "edit", "multi_modal_data": {"image": img}}, "e-b")
+    assert ti2i_a != ti2i_b and ti2i_a[1] == "ti2i"
+
+
+class _GeneratorRecordingVAE:
+    """Fake VAE that records the generator passed to each latent ``sample()``."""
+
+    dtype = torch.float32
+
+    def __init__(self):
+        self.config = SimpleNamespace(scaling_factor=1.0, shift_factor=0.0)
+        self.seen_generators = []
+
+    def encode(self, img):
+        def sample(generator=None):
+            self.seen_generators.append(generator)
+            return torch.zeros(1, 4, 2, 2)
+
+        return SimpleNamespace(latent_dist=SimpleNamespace(sample=sample))
+
+
+def test_build_ref_latents_uses_per_request_generators():
+    pipeline = _make_encode_pipeline()
+    pipeline.vae = _GeneratorRecordingVAE()
+
+    g0 = torch.Generator().manual_seed(0)
+    g1 = torch.Generator().manual_seed(1)
+    preprocessed = [torch.zeros(1, 3, 16, 16), None, torch.zeros(1, 3, 16, 16)]
+
+    pipeline._build_ref_latents(
+        preprocessed,
+        num_images_per_prompt=1,
+        device=torch.device("cpu"),
+        generators=[g0, None, g1],
+    )
+
+    # Each present reference row samples with its own request's generator; the
+    # None reference row consumes none.
+    assert pipeline.vae.seen_generators == [g0, g1]
+
+
+def test_forward_request_batch_collates_generators_and_splits_outputs():
+    from vllm_omni.diffusion.data import DiffusionOutput
+
+    pipeline = _make_forward_pipeline()
+    recorded = {}
+
+    def fake_encode_prompt(prompt, **kwargs):
+        n = len(prompt)
+        embeds = torch.zeros(n, _SEQ_LEN, _EMBED_DIM)
+        mask = torch.ones(n, _SEQ_LEN, dtype=torch.long)
+        return embeds, mask, None, None
+
+    def fake_prepare_latents(batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
+        recorded["generator"] = generator
+        # A distinct constant per batch row so the split can be verified.
+        rows = torch.arange(batch_size, dtype=torch.float32).view(batch_size, 1, 1, 1)
+        return rows.repeat(1, num_channels_latents, 2, 2)
+
+    pipeline.encode_prompt = fake_encode_prompt
+    pipeline.prepare_latents = fake_prepare_latents
+
+    # T2I, CFG off, 1 step, latent output -> avoids VAE decode and CFG branches.
+    s0 = _sampling(height=64, width=64, num_inference_steps=1, guidance_scale=1.0, output_type="latent")
+    s1 = _sampling(height=64, width=64, num_inference_steps=1, guidance_scale=1.0, output_type="latent")
+    req = _wrap_request_batch([("a cat", s0), ("a dog", s1)])
+    g0 = torch.Generator().manual_seed(0)
+    g1 = torch.Generator().manual_seed(1)
+    req.requests[0].sampling_params.generator = g0
+    req.requests[1].sampling_params.generator = g1
+
+    outs = pipeline.forward(req)
+
+    # forward() collates per-request generators rather than reusing req0's.
+    assert recorded["generator"] == [g0, g1]
+    # One DiffusionOutput per request, in scheduler order.
+    assert len(outs) == 2
+    assert all(isinstance(o, DiffusionOutput) for o in outs)
+    assert float(outs[0].output[0, 0, 0, 0]) == 0.0
+    assert float(outs[1].output[0, 0, 0, 0]) == 1.0
+
+
+def test_reshape_mask_is_request_major_with_distinct_masks():
+    # B=2, N=2 with per-request-distinct masks: reshaped rows must be
+    # request-major [p0, p0, p1, p1] (repeat_interleave) to match the embed
+    # layout, not tiled [p0, p1, p0, p1] (a plain repeat).
+    pipeline = _make_encode_pipeline()
+    embeds = torch.zeros(2, _SEQ_LEN, _EMBED_DIM)
+    mask = torch.tensor([[1, 1, 1, 1, 1, 0], [1, 1, 1, 0, 0, 0]], dtype=torch.long)
+    _, _, _, reshaped_mask = pipeline._reshape_embeds_and_mask(embeds, mask, 2)
+    assert reshaped_mask.shape == (4, _SEQ_LEN)
+    assert torch.equal(reshaped_mask[0], mask[0])
+    assert torch.equal(reshaped_mask[1], mask[0])
+    assert torch.equal(reshaped_mask[2], mask[1])
+    assert torch.equal(reshaped_mask[3], mask[1])
+
+
+def test_forward_request_batch_num_outputs_slices_and_generators():
+    pipeline = _make_forward_pipeline()
+    recorded = {}
+
+    def fake_encode_prompt(prompt, **kwargs):
+        n = len(prompt)
+        return torch.zeros(n, _SEQ_LEN, _EMBED_DIM), torch.ones(n, _SEQ_LEN, dtype=torch.long), None, None
+
+    def fake_prepare_latents(batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
+        recorded["generator"] = generator
+        rows = torch.arange(batch_size, dtype=torch.float32).view(batch_size, 1, 1, 1)
+        return rows.repeat(1, num_channels_latents, 2, 2)
+
+    pipeline.encode_prompt = fake_encode_prompt
+    pipeline.prepare_latents = fake_prepare_latents
+
+    kw = dict(
+        height=64, width=64, num_inference_steps=1, guidance_scale=1.0, output_type="latent", num_outputs_per_prompt=2
+    )
+    req = _wrap_request_batch([("a cat", _sampling(**kw)), ("a dog", _sampling(**kw))])
+    g0 = torch.Generator().manual_seed(0)
+    g1 = torch.Generator().manual_seed(1)
+    req.requests[0].sampling_params.generator = g0
+    req.requests[1].sampling_params.generator = g1
+
+    outs = pipeline.forward(req)
+
+    # collated generator is request-major, output-minor.
+    assert recorded["generator"] == [g0, g0, g1, g1]
+    # each request gets its own 2-output slice: req0 rows [0,1], req1 rows [2,3].
+    assert len(outs) == 2
+    assert outs[0].output.shape[0] == 2 and outs[1].output.shape[0] == 2
+    assert float(outs[0].output[0, 0, 0, 0]) == 0.0 and float(outs[0].output[1, 0, 0, 0]) == 1.0
+    assert float(outs[1].output[0, 0, 0, 0]) == 2.0 and float(outs[1].output[1, 0, 0, 0]) == 3.0
+
+
+def test_forward_batched_ti2i_fails_closed():
+    # The reference-image (edit) path is not cross-request safe; a multi-request
+    # ti2i batch must raise rather than silently contaminate.
+    pipeline = _make_forward_pipeline()
+
+    def edit_prompt():
+        return {
+            "prompt": "make it winter",
+            "additional_information": {"preprocessed_image": torch.zeros(1, 3, 64, 64), "prompt_image": None},
+        }
+
+    req = _wrap_request_batch(
+        [
+            (edit_prompt(), _sampling(num_inference_steps=1, guidance_scale=1.0)),
+            (edit_prompt(), _sampling(num_inference_steps=1, guidance_scale=1.0)),
+        ]
+    )
+    with pytest.raises(RuntimeError, match="not cross-request safe"):
+        pipeline.forward(req)
+
+
+def test_supports_request_batch_enabled():
+    from vllm_omni.diffusion.models.boogu_image import BooguImagePipeline
+
+    assert BooguImagePipeline.supports_request_batch is True
