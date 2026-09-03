@@ -976,7 +976,7 @@ def test_boogu_batch_compatibility_key_t2i_stable_ti2i_unique():
     assert _boogu_batch_compatibility_key(False, "req-a")[1] == "t2i"
 
     # ti2i (edit): request_id is in the key -> every edit gets a unique key and
-    # the scheduler never co-batches edits (reference path not cross-request safe).
+    # the scheduler never co-batches edits (ti2i gets a request-unique key).
     assert _boogu_batch_compatibility_key(True, "req-a") != _boogu_batch_compatibility_key(True, "req-b")
     assert _boogu_batch_compatibility_key(True, "req-a")[1] == "ti2i"
 
@@ -1144,8 +1144,8 @@ def test_forward_request_batch_num_outputs_slices_and_generators():
 
 
 def test_forward_batched_ti2i_fails_closed():
-    # The reference-image (edit) path is not cross-request safe; a multi-request
-    # ti2i batch must raise rather than silently contaminate.
+    # TI2I batching is gated to batch=1 (guidance-mode / compatibility-key
+    # validation pending); a multi-request ti2i batch must raise, not slip through.
     pipeline = _make_forward_pipeline()
 
     def edit_prompt():
@@ -1160,7 +1160,7 @@ def test_forward_batched_ti2i_fails_closed():
             (edit_prompt(), _sampling(num_inference_steps=1, guidance_scale=1.0)),
         ]
     )
-    with pytest.raises(RuntimeError, match="not cross-request safe"):
+    with pytest.raises(RuntimeError, match="gated to batch=1"):
         pipeline.forward(req)
 
 
