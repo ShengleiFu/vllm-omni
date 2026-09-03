@@ -1142,6 +1142,58 @@ def test_forward_request_batch_num_outputs_slices_and_generators():
     assert float(outs[1].output[0, 0, 0, 0]) == 2.0 and float(outs[1].output[1, 0, 0, 0]) == 3.0
 
 
+def test_forward_batch_isolation_partner_content_and_seed():
+    """CFG-on, B=2: request A's output must not change when only the
+    co-batched partner's prompt content, negative prompt, or seed changes.
+
+    ``_FakeTransformer``/``_FakeScheduler`` are content-blind (always-zero
+    velocity, latents passed through unchanged), so they cannot catch a
+    cross-request value leak. This test swaps in a transformer whose output
+    depends on both ``instruction_embeds`` (content, positive or negative
+    depending on which CFG branch called it) and ``latents`` (seed), and a
+    scheduler that actually applies the predicted velocity, so a batching bug
+    that mixes rows in either the cond or uncond prediction would change A's
+    result. A negative-prompt-only perturbation is required to cover the
+    uncond branch: varying only the positive prompt never touches
+    ``negative_instruction_embeds``, so an earlier version of this test
+    passed even with a synthetic row-mixing bug injected into the uncond
+    predict() call (verified via a RED-arm check before this fix).
+    """
+
+    class _ContentAwareTransformer(_FakeTransformer):
+        def __call__(self, latents, timestep, instruction_embeds, freqs_real, instruction_attention_mask, **kwargs):
+            content = instruction_embeds.mean(dim=(1, 2)).view(-1, 1, 1, 1)
+            return latents + content
+
+    class _ApplyingScheduler(_FakeScheduler):
+        def step(self, model_output, t, latents, return_dict=False):
+            return (model_output,)
+
+    def run(prompt_a, seed_a, neg_a, prompt_b, seed_b, neg_b):
+        pipeline = _make_forward_pipeline()
+        pipeline.transformer = _ContentAwareTransformer()
+        pipeline.scheduler = _ApplyingScheduler()
+        kw = dict(height=64, width=64, num_inference_steps=2, guidance_scale=4.0, output_type="latent")
+        req = _wrap_request_batch(
+            [
+                (
+                    {"prompt": prompt_a, "negative_prompt": neg_a},
+                    _sampling(**kw, generator=torch.Generator().manual_seed(seed_a)),
+                ),
+                (
+                    {"prompt": prompt_b, "negative_prompt": neg_b},
+                    _sampling(**kw, generator=torch.Generator().manual_seed(seed_b)),
+                ),
+            ]
+        )
+        return pipeline.forward(req)[0].output
+
+    baseline = run("a cat on a mat", 1, "ugly", "a dog in a park", 2, "blurry")
+    assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a totally different scene", 2, "blurry"))
+    assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a dog in a park", 999, "blurry"))
+    assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a dog in a park", 2, "watermark"))
+
+
 def test_forward_batched_ti2i_fails_closed():
     # A batched ti2i must fail closed (it is gated to batch=1).
     pipeline = _make_forward_pipeline()
