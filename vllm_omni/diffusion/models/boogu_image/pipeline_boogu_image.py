@@ -101,17 +101,13 @@ def get_boogu_image_post_process_func(od_config: OmniDiffusionConfig):
 
 
 def _boogu_batch_compatibility_key(has_reference: bool, request_id: str) -> tuple:
-    """Request-batch isolation key consumed by the scheduler.
+    """Request-batch isolation key. ``forward`` reads shared guidance/shape fields
+    from the batch's first request, so t2i and ti2i must not share a key.
 
-    ``forward`` derives a single ``task_type`` and reads shared guidance/shape
-    fields from the batch's first request, so t2i and ti2i must not share a key.
-    t2i requests get a stable key and batch together. ti2i (edit) requests get a
-    request-unique key so each runs at batch=1: TI2I batching is not yet validated
-    across all guidance modes (image-only, double-guidance) or compatibility-key
-    combinations. Notably ``guidance_scale_2_provided`` is absent from
-    ``RequestBatchSamplingParamsKey`` while ``forward`` reads it from the first
-    request to gate image guidance, so mixed-``_provided`` edits with equal numeric
-    ``guidance_scale_2`` could co-batch into the wrong guidance mode.
+    ti2i is held at batch=1 (request-unique key) because
+    ``guidance_scale_2_provided`` is absent from ``RequestBatchSamplingParamsKey``
+    while ``forward`` reads it from the first request, so mixed-``_provided`` edits
+    with equal numeric ``guidance_scale_2`` would co-batch into the wrong mode.
     """
     if not has_reference:
         return ("boogu_image", "t2i")
@@ -667,12 +663,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         has_reference = any(img is not None for img in preprocessed_images)
         task_type = "ti2i" if has_reference else "t2i"
 
-        # Fail-closed: TI2I batching is not yet validated across all guidance
-        # modes and compatibility-key combinations (see
-        # _boogu_batch_compatibility_key). batch_compatibility_key gives every
-        # ti2i request a unique key so the scheduler runs edits at batch=1; this
-        # guards against a regression that lets a batched edit slip through before
-        # that validation lands.
+        # Fail-closed: a batched ti2i must never reach here (it is gated to batch=1).
         if has_reference and req.num_reqs > 1:
             raise RuntimeError(
                 f"BooguImagePipeline received a batched TI2I (edit) request "
