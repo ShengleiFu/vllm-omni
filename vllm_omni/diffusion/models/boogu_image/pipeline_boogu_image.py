@@ -106,18 +106,18 @@ def get_boogu_image_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-def _boogu_batch_compatibility_key(has_reference: bool, request_id: str) -> tuple:
-    """Request-batch isolation key. ``forward`` reads shared guidance/shape fields
-    from the batch's first request, so t2i and ti2i must not share a key.
-
-    ti2i is held at batch=1 (request-unique key) because
-    ``guidance_scale_2_provided`` is absent from ``RequestBatchSamplingParamsKey``
-    while ``forward`` reads it from the first request, so mixed-``_provided`` edits
-    with equal numeric ``guidance_scale_2`` would co-batch into the wrong mode.
+def _boogu_batch_compatibility_key(has_reference: bool) -> tuple:
+    """Request-batch isolation key. ``forward`` reads shared shape/guidance fields
+    from the batch's first request, so t2i and ti2i must not share a key: they
+    take structurally different denoise paths (ti2i threads reference latents and
+    can run the double-guidance three-prediction branch). Guidance mode is fully
+    separated by ``RequestBatchSamplingParamsKey`` (including
+    ``guidance_scale_2_provided``), so requests that share this key are safe to
+    co-batch.
     """
     if not has_reference:
         return ("boogu_image", "t2i")
-    return ("boogu_image", "ti2i", request_id)
+    return ("boogu_image", "ti2i")
 
 
 def get_boogu_image_pre_process_func(od_config: OmniDiffusionConfig):
@@ -151,14 +151,14 @@ def get_boogu_image_pre_process_func(od_config: OmniDiffusionConfig):
         prompt = request.prompt
         if isinstance(prompt, str):
             # Plain-text prompt cannot carry an image -> text-to-image.
-            request.batch_compatibility_key = _boogu_batch_compatibility_key(False, request.request_id)
+            request.batch_compatibility_key = _boogu_batch_compatibility_key(False)
             return request
 
         multi_modal_data = prompt.get("multi_modal_data") or {}
         raw_image = multi_modal_data.get("image")
         if not raw_image:
             # No reference image -> text-to-image (Base checkpoint).
-            request.batch_compatibility_key = _boogu_batch_compatibility_key(False, request.request_id)
+            request.batch_compatibility_key = _boogu_batch_compatibility_key(False)
             return request
 
         if isinstance(raw_image, list):
@@ -193,7 +193,7 @@ def get_boogu_image_pre_process_func(od_config: OmniDiffusionConfig):
         prompt["additional_information"]["preprocessed_image"] = preprocessed_image
         prompt["additional_information"]["prompt_image"] = prompt_image
         request.prompt = prompt
-        request.batch_compatibility_key = _boogu_batch_compatibility_key(True, request.request_id)
+        request.batch_compatibility_key = _boogu_batch_compatibility_key(True)
         return request
 
     return pre_process_func
@@ -876,14 +876,6 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         # in the request-batch compatibility key, so Turbo stays at batch=1.
         if self._is_turbo and req.num_reqs > 1:
             raise RuntimeError("BooguImageTurboPipeline does not support request batching.")
-
-        # Fail-closed: a batched ti2i must never reach here (it is gated to batch=1).
-        if has_reference and req.num_reqs > 1:
-            raise RuntimeError(
-                f"BooguImagePipeline received a batched TI2I (edit) request "
-                f"(num_reqs={req.num_reqs}); TI2I batching is gated to batch=1 "
-                "pending guidance-mode / compatibility-key validation."
-            )
 
         sampling_params_list = req.sampling_params_list
         # Shared shape/step/guidance fields are guaranteed identical across the

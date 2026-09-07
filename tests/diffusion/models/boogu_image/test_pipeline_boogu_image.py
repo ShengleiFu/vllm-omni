@@ -13,6 +13,7 @@ Two groups:
    CFG handling, and reshape logic can be verified numerically on CPU.
 """
 
+import zlib
 from types import SimpleNamespace
 
 import pytest
@@ -275,8 +276,28 @@ def test_constructor_accepts_cfg_parallel(mock_dependencies, cfg_parallel_size):
 # ---------------------------------------------------------------------------
 
 
+def _content_id(text: str) -> int:
+    """Deterministic per-text id for the fake processors below.
+
+    CRC32 (not builtin ``hash()``, which is salted per-process via
+    ``PYTHONHASHSEED`` unless disabled) so two same-length-different-content
+    strings map to different ids reliably across every run/seed, not just
+    the one a test happened to be authored/verified under -- a test whose
+    detection power silently varies by process hash seed defeats the
+    purpose of this fixture. Full 31-bit range (not ``% 997``) keeps the
+    collision probability per pair at ~2^-31, not ~1/997.
+    """
+    return zlib.crc32(text.encode()) & 0x7FFFFFFF
+
+
 class _RecordingProcessor:
-    """Fake Qwen3VLProcessor: deterministic token ids derived from the text."""
+    """Fake Qwen3VLProcessor: deterministic token ids derived from the text.
+
+    Ids are a content hash (see ``_content_id``) rather than a length, so a
+    cross-request content leak involving equal-length partner strings cannot
+    pass a downstream isolation test vacuously the way ``len(text) % N``
+    would (which collides on same-length inputs by construction).
+    """
 
     def __init__(self):
         self.calls = []
@@ -288,8 +309,8 @@ class _RecordingProcessor:
         for i, messages in enumerate(prompts):
             system_text = messages[0]["content"][0]["text"]
             user_text = messages[1]["content"][0]["text"]
-            input_ids[i, 0] = len(system_text) % 997
-            input_ids[i, 1] = len(user_text) % 997
+            input_ids[i, 0] = _content_id(system_text)
+            input_ids[i, 1] = _content_id(user_text)
             input_ids[i, 2:] = torch.arange(2, _SEQ_LEN) + i
         attention_mask = torch.ones(batch, _SEQ_LEN, dtype=torch.long)
         attention_mask[:, -1] = 0  # fake right-padding
@@ -1038,7 +1059,16 @@ def test_apply_chat_template_ti2i_places_image_before_text():
 
 
 class _ImageAwareRecordingProcessor:
-    """Records whether reference images reached the processor."""
+    """Records whether reference images reached the processor.
+
+    Like ``_RecordingProcessor``, token ids are derived from the actual text
+    (not just batch size/position) via ``_content_id``, so a test that swaps
+    in different prompt or negative-prompt text gets different input_ids and
+    can detect a cross-request content leak downstream. TI2I places the
+    image before the text (see
+    test_apply_chat_template_ti2i_places_image_before_text), so the text item
+    is found by type rather than assumed to be content[0].
+    """
 
     def __init__(self):
         self.calls = []
@@ -1050,7 +1080,13 @@ class _ImageAwareRecordingProcessor:
             has_image.append(any(c.get("type") == "image" for c in user_content))
         self.calls.append({"prompts": prompts, "kwargs": kwargs, "has_image": has_image})
         batch = len(prompts)
-        input_ids = torch.arange(batch * _SEQ_LEN, dtype=torch.long).view(batch, _SEQ_LEN)
+        input_ids = torch.zeros(batch, _SEQ_LEN, dtype=torch.long)
+        for i, messages in enumerate(prompts):
+            system_text = messages[0]["content"][0]["text"]
+            user_text = next(c["text"] for c in messages[1]["content"] if c.get("type") == "text")
+            input_ids[i, 0] = _content_id(system_text)
+            input_ids[i, 1] = _content_id(user_text)
+            input_ids[i, 2:] = torch.arange(2, _SEQ_LEN) + i
         attention_mask = torch.ones(batch, _SEQ_LEN, dtype=torch.long)
         return {"input_ids": input_ids, "attention_mask": attention_mask}
 
@@ -1317,25 +1353,26 @@ def test_forward_image_guidance_ignored_without_reference():
 # ---------------------------------------------------------------------------
 
 
-def test_boogu_batch_compatibility_key_t2i_stable_ti2i_unique():
+def test_boogu_batch_compatibility_key_t2i_and_ti2i_stable_and_isolated():
     from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import _boogu_batch_compatibility_key
 
-    # t2i: request_id does not enter the key -> t2i requests batch together.
-    assert _boogu_batch_compatibility_key(False, "req-a") == _boogu_batch_compatibility_key(False, "req-b")
-    assert _boogu_batch_compatibility_key(False, "req-a")[1] == "t2i"
+    # t2i requests share a stable key -> they batch together.
+    assert _boogu_batch_compatibility_key(False) == ("boogu_image", "t2i")
 
-    # ti2i: request_id in the key -> each edit gets a unique key, never co-batched.
-    assert _boogu_batch_compatibility_key(True, "req-a") != _boogu_batch_compatibility_key(True, "req-b")
-    assert _boogu_batch_compatibility_key(True, "req-a")[1] == "ti2i"
+    # ti2i requests share a stable key too -> edits batch together. Guidance mode
+    # (including guidance_scale_2_provided) is separated upstream by
+    # RequestBatchSamplingParamsKey, not by this condition key.
+    assert _boogu_batch_compatibility_key(True) == ("boogu_image", "ti2i")
 
-    # t2i and ti2i never share a key.
-    assert _boogu_batch_compatibility_key(False, "req-a") != _boogu_batch_compatibility_key(True, "req-a")
+    # t2i and ti2i never share a key (structurally different denoise paths).
+    assert _boogu_batch_compatibility_key(False) != _boogu_batch_compatibility_key(True)
 
 
-def test_pre_process_key_wiring_t2i_batches_ti2i_isolated(tmp_path):
+def test_pre_process_key_wiring_t2i_and_ti2i_batch(tmp_path):
     # End-to-end: real pre-process sets request.batch_compatibility_key, and the
     # scheduler's key builder reads it into condition_key. Two t2i requests share
-    # a key (co-batchable); two edit requests get distinct keys (batch=1).
+    # a key and two edit requests share a key -> both paths co-batch, while t2i
+    # and ti2i stay isolated from each other.
     import PIL.Image
 
     from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import get_boogu_image_pre_process_func
@@ -1359,7 +1396,8 @@ def test_pre_process_key_wiring_t2i_batches_ti2i_isolated(tmp_path):
     img = PIL.Image.new("RGB", (64, 64))
     ti2i_a = condition_key({"prompt": "edit", "multi_modal_data": {"image": img}}, "e-a")
     ti2i_b = condition_key({"prompt": "edit", "multi_modal_data": {"image": img}}, "e-b")
-    assert ti2i_a != ti2i_b and ti2i_a[1] == "ti2i"
+    assert ti2i_a == ti2i_b and ti2i_a[1] == "ti2i"
+    assert t2i_a != ti2i_a
 
 
 class _GeneratorRecordingVAE:
@@ -1541,26 +1579,103 @@ def test_forward_batch_isolation_partner_content_and_seed():
     assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a totally different scene", 2, "blurry"))
     assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a dog in a park", 999, "blurry"))
     assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a dog in a park", 2, "watermark"))
+    # Same character length as the baseline partner strings (16 and 6 chars) so this
+    # only passes if ids come from content, not length.
+    assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a fox in a cave", 2, "blurry"))
+    assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a dog in a park", 2, "grainy"))
 
 
-def test_forward_batched_ti2i_fails_closed():
-    # A batched ti2i must fail closed (it is gated to batch=1).
-    pipeline = _make_forward_pipeline()
+def test_forward_batched_ti2i_partner_reference_isolation():
+    """Double-guidance edit, B=2: request A's output must not change when only
+    the co-batched partner's reference image, prompt, negative prompt, or seed
+    changes.
 
-    def edit_prompt():
+    This exercises the batched ti2i path the removed fail-closed guard used to
+    reject, and covers the per-request reference latent that the t2i isolation
+    test cannot reach. The transformer output depends on ``instruction_embeds``
+    (prompt content), ``latents`` (seed), and ``ref_image_hidden_states`` (the
+    reference latent), and the scheduler applies the predicted velocity, so a
+    batching bug that mixed any per-request row across the batch would change A.
+    Double guidance is used so all three predictions per step run, including the
+    reference-carrying branches.
+    """
+    import PIL.Image
+
+    class _ContentRefTransformer(_FakeTransformer):
+        def __call__(self, latents, timestep, instruction_embeds, freqs_real, instruction_attention_mask, **kwargs):
+            out = latents + instruction_embeds.mean(dim=(1, 2)).view(-1, 1, 1, 1)
+            # ref_image_hidden_states is a per-request list ([lat] or None); fold
+            # each request's reference latent into its own row so a cross-request
+            # reference leak would change A's output.
+            ref = kwargs.get("ref_image_hidden_states")
+            if ref is not None:
+                ref_means = torch.tensor(
+                    [float(r[0].float().mean()) if r is not None else 0.0 for r in ref],
+                    dtype=out.dtype,
+                    device=out.device,
+                ).view(-1, 1, 1, 1)
+                out = out + ref_means
+            return out
+
+    class _ApplyingScheduler(_FakeScheduler):
+        def step(self, model_output, t, latents, return_dict=False):
+            return (model_output,)
+
+    class _RefContentVAE(_EditForwardVAE):
+        def encode(self, img):
+            val = float(img.float().mean().item())
+            dist = SimpleNamespace(sample=lambda generator=None: torch.full((1, 4, 8, 8), val))
+            return SimpleNamespace(latent_dist=dist)
+
+    prompt_image = PIL.Image.new("RGB", (64, 64))
+
+    def edit_prompt(text, neg, ref_fill):
         return {
-            "prompt": "make it winter",
-            "additional_information": {"preprocessed_image": torch.zeros(1, 3, 64, 64), "prompt_image": None},
+            "prompt": text,
+            "negative_prompt": neg,
+            "additional_information": {
+                "prompt_image": prompt_image,
+                "preprocessed_image": torch.full((1, 3, 64, 64), ref_fill),
+            },
         }
 
-    req = _wrap_request_batch(
-        [
-            (edit_prompt(), _sampling(num_inference_steps=1, guidance_scale=1.0)),
-            (edit_prompt(), _sampling(num_inference_steps=1, guidance_scale=1.0)),
-        ]
-    )
-    with pytest.raises(RuntimeError, match="gated to batch=1"):
-        pipeline.forward(req)
+    def run(prompt_b, neg_b, seed_b, ref_fill_b):
+        pipeline = _make_edit_forward_pipeline()
+        pipeline.transformer = _ContentRefTransformer()
+        pipeline.scheduler = _ApplyingScheduler()
+        pipeline.vae = _RefContentVAE()
+        kw = dict(
+            height=64,
+            width=64,
+            num_inference_steps=2,
+            guidance_scale=5.0,
+            guidance_scale_2=2.0,
+            output_type="latent",
+        )
+        req = _wrap_request_batch(
+            [
+                (
+                    edit_prompt("make it winter", "ugly", 0.25),
+                    _sampling(**kw, generator=torch.Generator().manual_seed(1)),
+                ),
+                (
+                    edit_prompt(prompt_b, neg_b, ref_fill_b),
+                    _sampling(**kw, generator=torch.Generator().manual_seed(seed_b)),
+                ),
+            ]
+        )
+        return pipeline.forward(req)[0].output
+
+    baseline = run("a dog in a park", "blurry", 2, 0.75)
+    assert torch.equal(baseline, run("a totally different scene", "blurry", 2, 0.75))
+    assert torch.equal(baseline, run("a dog in a park", "watermark", 2, 0.75))
+    assert torch.equal(baseline, run("a dog in a park", "blurry", 999, 0.75))
+    assert torch.equal(baseline, run("a dog in a park", "blurry", 2, 0.5))
+    # Same character length as the baseline strings (16 and 6 chars respectively) so
+    # this only passes if ids are derived from content, not length -- a length-keyed
+    # fake (e.g. len(text) % N) would alias these to the baseline and pass vacuously.
+    assert torch.equal(baseline, run("a fox in a cave", "blurry", 2, 0.75))
+    assert torch.equal(baseline, run("a dog in a park", "grainy", 2, 0.75))
 
 
 def test_supports_request_batch_enabled():
