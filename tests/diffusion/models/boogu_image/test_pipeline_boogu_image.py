@@ -1643,7 +1643,11 @@ def test_forward_batch_isolation_partner_content_and_seed(monkeypatch):
 
     # RED-arm: confirm a real cross-request generator-mixing bug (reversed
     # per-row assignment) makes the seed-invariance assert above actually
-    # fail, i.e. that assert is not vacuous.
+    # fail, i.e. that assert is not vacuous. Compare baseline and the
+    # partner-seed mutation BOTH under the same active bug (not the clean
+    # baseline against a buggy mutated run) -- otherwise a passing "not equal"
+    # only proves the bug changes *something*, not specifically that B's own
+    # seed now leaks into A.
     from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
     real_collate = DiffusionRequestBatch.collate_request_generators
@@ -1653,7 +1657,8 @@ def test_forward_batch_isolation_partner_content_and_seed(monkeypatch):
         return list(reversed(result)) if isinstance(result, list) and len(result) > 1 else result
 
     monkeypatch.setattr(DiffusionRequestBatch, "collate_request_generators", reversed_collate)
-    assert not torch.equal(seed_baseline, run_seed(1, 999))
+    buggy_seed_baseline = run_seed(1, 2)
+    assert not torch.equal(buggy_seed_baseline, run_seed(1, 999))
 
 
 def test_forward_batched_ti2i_partner_reference_isolation(monkeypatch):
@@ -1769,11 +1774,20 @@ def test_forward_batched_ti2i_partner_reference_isolation(monkeypatch):
         def __call__(self, latents, timestep, instruction_embeds, freqs_real, instruction_attention_mask, **kwargs):
             ref = kwargs.get("ref_image_hidden_states")
             if ref is None:
-                # Some CFG branches (e.g. the text-only unconditional predict)
-                # don't carry reference state at all; leave latents untouched
-                # (they're discarded by the scheduler's own step logic when
-                # combined across branches) rather than crash.
-                return latents
+                # The double-guidance combine is `pwr + (text-1)*(pwr-nwr) +
+                # (image-1)*(nwr-uncond)`; with pwr=nwr=r (both reference
+                # branches constant) this reduces to `r + (image-1)*(r-uncond)`.
+                # If `uncond` (this branch) fed back the CURRENT `latents`
+                # (which the scheduler sets to the previous step's combined
+                # output), the recursion oscillates and cancels the reference
+                # signal entirely after 2 steps: step0 gives `image*r -
+                # (image-1)*x0`, and feeding THAT back as `uncond` in step1
+                # reintroduces `x0` and cancels `r` (verified: with
+                # image_gs=2, x1=2r-x0, x2=x0 -- exactly independent of `r`).
+                # A state-INDEPENDENT constant (zero, not `latents`) keeps
+                # every branch state-independent, so the combine is a stable
+                # fixed point at a value that actually depends on `r`.
+                return torch.zeros_like(latents)
             ref_means = torch.tensor(
                 [float(r[0].float().mean()) if r is not None else 0.0 for r in ref],
                 dtype=latents.dtype,
@@ -1819,7 +1833,10 @@ def test_forward_batched_ti2i_partner_reference_isolation(monkeypatch):
 
     # RED-arm: confirm real cross-request mixing bugs make the reference-fill
     # and seed invariance asserts above actually fail, i.e. they are not
-    # vacuous.
+    # vacuous. Compare baseline and the partner mutation BOTH under the same
+    # active bug (not the clean baseline against a buggy mutated run) --
+    # otherwise a passing "not equal" only proves the bug changes *something*,
+    # not specifically that B's own input now leaks into A.
     from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
     from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
@@ -1830,7 +1847,8 @@ def test_forward_batched_ti2i_partner_reference_isolation(monkeypatch):
         return real_build_ref_latents(self, swapped, num_images_per_prompt, device, generators)
 
     monkeypatch.setattr(BooguImagePipeline, "_build_ref_latents", reversed_build_ref_latents)
-    assert not torch.equal(ref_baseline, run_isolated(_RefOnlyTransformer, 0.25, 1, 0.5, 2))
+    buggy_ref_baseline = run_isolated(_RefOnlyTransformer, 0.25, 1, 0.75, 2)
+    assert not torch.equal(buggy_ref_baseline, run_isolated(_RefOnlyTransformer, 0.25, 1, 0.5, 2))
     monkeypatch.undo()
 
     real_collate = DiffusionRequestBatch.collate_request_generators
@@ -1840,7 +1858,8 @@ def test_forward_batched_ti2i_partner_reference_isolation(monkeypatch):
         return list(reversed(result)) if isinstance(result, list) and len(result) > 1 else result
 
     monkeypatch.setattr(DiffusionRequestBatch, "collate_request_generators", reversed_collate)
-    assert not torch.equal(seed_baseline, run_isolated(_LatentsOnlyTransformer, 0.25, 1, 0.75, 999))
+    buggy_seed_baseline = run_isolated(_LatentsOnlyTransformer, 0.25, 1, 0.75, 2)
+    assert not torch.equal(buggy_seed_baseline, run_isolated(_LatentsOnlyTransformer, 0.25, 1, 0.75, 999))
 
 
 def test_supports_request_batch_enabled():
