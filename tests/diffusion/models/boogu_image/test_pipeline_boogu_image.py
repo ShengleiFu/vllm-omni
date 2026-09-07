@@ -284,10 +284,32 @@ def _content_id(text: str) -> int:
     strings map to different ids reliably across every run/seed, not just
     the one a test happened to be authored/verified under -- a test whose
     detection power silently varies by process hash seed defeats the
-    purpose of this fixture. Full 31-bit range (not ``% 997``) keeps the
-    collision probability per pair at ~2^-31, not ~1/997.
+    purpose of this fixture.
+
+    Reduced mod 9973 (not the full 31-bit CRC32 range): some tests build a
+    fake "embedding" directly from these ids (``input_ids.float()``, no
+    lookup table) and mean-reduce it. A full ~2^31-range id makes that mean
+    ~1e8-2e8, which is large enough that a real per-request signal summed
+    into the *same* tensor -- a 0.25 reference-latent fill delta, or
+    seed-driven ``latents`` noise -- rounds away completely, in bfloat16
+    (8 mantissa bits) even more severely than in float32. Confirmed: a real
+    cross-request reference-mixing bug injected into ``_build_ref_latents``
+    still passed ``test_forward_batched_ti2i_partner_reference_isolation``
+    under the old full-range id, regardless of dtype.
+
+    9973 fixes this for the *content-only* isolation checks (content means
+    differ by far more than 9973's float32/bfloat16 ULP, and collisions are
+    unlikely for this file's short literal strings -- verified none among
+    them at this modulus). It does **not** by itself fix seed/reference
+    isolation: even at this reduced magnitude, a content mean in the
+    thousands still swamps an O(1)/0.25-scale signal in bfloat16 (ULP at
+    ~1e4 is ~1e2, far bigger than 0.25). The seed and reference isolation
+    checks in both isolation tests below use a *separate* fake transformer
+    that never sums content into the same tensor, so the small signal is
+    never swamped regardless of ``_content_id``'s range -- see the
+    ``_LatentsOnlyTransformer`` / ``_RefOnlyTransformer`` docstrings there.
     """
-    return zlib.crc32(text.encode()) & 0x7FFFFFFF
+    return zlib.crc32(text.encode()) % 9973
 
 
 class _RecordingProcessor:
@@ -1529,7 +1551,7 @@ def test_forward_request_batch_num_outputs_slices_and_generators():
     assert float(outs[1].output[0, 0, 0, 0]) == 2.0 and float(outs[1].output[1, 0, 0, 0]) == 3.0
 
 
-def test_forward_batch_isolation_partner_content_and_seed():
+def test_forward_batch_isolation_partner_content_and_seed(monkeypatch):
     """CFG-on, B=2: request A's output must not change when only the
     co-batched partner's prompt content, negative prompt, or seed changes.
 
@@ -1584,8 +1606,57 @@ def test_forward_batch_isolation_partner_content_and_seed():
     assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a fox in a cave", 2, "blurry"))
     assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a dog in a park", 2, "grainy"))
 
+    # Sensitivity control: the content invariance asserts above are only
+    # meaningful if this harness actually reacts to A's OWN content -- confirm
+    # changing A's own prompt or negative prompt changes A's own output.
+    assert not torch.equal(baseline, run("a totally different scene", 1, "ugly", "a dog in a park", 2, "blurry"))
+    assert not torch.equal(baseline, run("a cat on a mat", 1, "watermark", "a dog in a park", 2, "blurry"))
 
-def test_forward_batched_ti2i_partner_reference_isolation():
+    # Seed isolation, checked separately from content: ``_ContentAwareTransformer``
+    # adds ``latents`` to a content term whose magnitude (thousands, from
+    # ``_content_id``) swamps the O(1) seed-driven noise in ``latents`` under
+    # bfloat16 (8 mantissa bits) -- confirmed empirically: the seed-invariance
+    # assert below was bit-identical for seed_a in {1, 999} even through this
+    # same content-summing transformer, i.e. it was vacuous regardless of
+    # ``_content_id``'s range. A transformer that returns ``latents`` alone
+    # (no content term at all) is required to actually exercise seed.
+    class _LatentsOnlyTransformer(_FakeTransformer):
+        def __call__(self, latents, timestep, instruction_embeds, freqs_real, instruction_attention_mask, **kwargs):
+            return latents
+
+    def run_seed(seed_a, seed_b):
+        pipeline = _make_forward_pipeline()
+        pipeline.transformer = _LatentsOnlyTransformer()
+        pipeline.scheduler = _ApplyingScheduler()
+        kw = dict(height=64, width=64, num_inference_steps=2, guidance_scale=4.0, output_type="latent")
+        req = _wrap_request_batch(
+            [
+                ("a cat on a mat", _sampling(**kw, generator=torch.Generator().manual_seed(seed_a))),
+                ("a dog in a park", _sampling(**kw, generator=torch.Generator().manual_seed(seed_b))),
+            ]
+        )
+        return pipeline.forward(req)[0].output
+
+    seed_baseline = run_seed(1, 2)
+    assert torch.equal(seed_baseline, run_seed(1, 999))  # B's seed must not affect A
+    assert not torch.equal(seed_baseline, run_seed(999, 2))  # A's own seed must affect A
+
+    # RED-arm: confirm a real cross-request generator-mixing bug (reversed
+    # per-row assignment) makes the seed-invariance assert above actually
+    # fail, i.e. that assert is not vacuous.
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+
+    real_collate = DiffusionRequestBatch.collate_request_generators
+
+    def reversed_collate(self, num_outputs_per_prompt, default_generator):
+        result = real_collate(self, num_outputs_per_prompt, default_generator)
+        return list(reversed(result)) if isinstance(result, list) and len(result) > 1 else result
+
+    monkeypatch.setattr(DiffusionRequestBatch, "collate_request_generators", reversed_collate)
+    assert not torch.equal(seed_baseline, run_seed(1, 999))
+
+
+def test_forward_batched_ti2i_partner_reference_isolation(monkeypatch):
     """Double-guidance edit, B=2: request A's output must not change when only
     the co-batched partner's reference image, prompt, negative prompt, or seed
     changes.
@@ -1639,7 +1710,7 @@ def test_forward_batched_ti2i_partner_reference_isolation():
             },
         }
 
-    def run(prompt_b, neg_b, seed_b, ref_fill_b):
+    def run(prompt_a, neg_a, seed_a, ref_fill_a, prompt_b, neg_b, seed_b, ref_fill_b):
         pipeline = _make_edit_forward_pipeline()
         pipeline.transformer = _ContentRefTransformer()
         pipeline.scheduler = _ApplyingScheduler()
@@ -1655,8 +1726,8 @@ def test_forward_batched_ti2i_partner_reference_isolation():
         req = _wrap_request_batch(
             [
                 (
-                    edit_prompt("make it winter", "ugly", 0.25),
-                    _sampling(**kw, generator=torch.Generator().manual_seed(1)),
+                    edit_prompt(prompt_a, neg_a, ref_fill_a),
+                    _sampling(**kw, generator=torch.Generator().manual_seed(seed_a)),
                 ),
                 (
                     edit_prompt(prompt_b, neg_b, ref_fill_b),
@@ -1666,16 +1737,110 @@ def test_forward_batched_ti2i_partner_reference_isolation():
         )
         return pipeline.forward(req)[0].output
 
-    baseline = run("a dog in a park", "blurry", 2, 0.75)
-    assert torch.equal(baseline, run("a totally different scene", "blurry", 2, 0.75))
-    assert torch.equal(baseline, run("a dog in a park", "watermark", 2, 0.75))
-    assert torch.equal(baseline, run("a dog in a park", "blurry", 999, 0.75))
-    assert torch.equal(baseline, run("a dog in a park", "blurry", 2, 0.5))
+    A = ("make it winter", "ugly", 1, 0.25)
+    baseline = run(*A, "a dog in a park", "blurry", 2, 0.75)
+    assert torch.equal(baseline, run(*A, "a totally different scene", "blurry", 2, 0.75))
+    assert torch.equal(baseline, run(*A, "a dog in a park", "watermark", 2, 0.75))
+    assert torch.equal(baseline, run(*A, "a dog in a park", "blurry", 999, 0.75))
+    assert torch.equal(baseline, run(*A, "a dog in a park", "blurry", 2, 0.5))
     # Same character length as the baseline strings (16 and 6 chars respectively) so
     # this only passes if ids are derived from content, not length -- a length-keyed
     # fake (e.g. len(text) % N) would alias these to the baseline and pass vacuously.
-    assert torch.equal(baseline, run("a fox in a cave", "blurry", 2, 0.75))
-    assert torch.equal(baseline, run("a dog in a park", "grainy", 2, 0.75))
+    assert torch.equal(baseline, run(*A, "a fox in a cave", "blurry", 2, 0.75))
+    assert torch.equal(baseline, run(*A, "a dog in a park", "grainy", 2, 0.75))
+
+    # Sensitivity control: the content invariance asserts above are only
+    # meaningful if this harness actually reacts to A's OWN prompt/negative
+    # prompt -- confirm changing either changes A's own output.
+    B = ("a dog in a park", "blurry", 2, 0.75)
+    assert not torch.equal(baseline, run("a totally different scene", "ugly", 1, 0.25, *B))
+    assert not torch.equal(baseline, run("make it winter", "watermark", 1, 0.25, *B))
+
+    # Reference-fill and seed isolation, checked separately from content:
+    # ``_ContentRefTransformer`` sums ``latents`` + a content term (thousands,
+    # from ``_content_id``) + ``ref_means`` -- the content term's magnitude
+    # swamps the 0.25/0.75-scale reference fill and the O(1) seed-driven noise
+    # in ``latents`` under bfloat16 (8 mantissa bits). Confirmed empirically:
+    # both the reference-fill and seed sensitivity asserts below were
+    # bit-identical for a changed A input, through this same content-summing
+    # transformer, regardless of ``_content_id``'s range. Dedicated
+    # content-free transformers are required to actually exercise each.
+    class _RefOnlyTransformer(_FakeTransformer):
+        def __call__(self, latents, timestep, instruction_embeds, freqs_real, instruction_attention_mask, **kwargs):
+            ref = kwargs.get("ref_image_hidden_states")
+            if ref is None:
+                # Some CFG branches (e.g. the text-only unconditional predict)
+                # don't carry reference state at all; leave latents untouched
+                # (they're discarded by the scheduler's own step logic when
+                # combined across branches) rather than crash.
+                return latents
+            ref_means = torch.tensor(
+                [float(r[0].float().mean()) if r is not None else 0.0 for r in ref],
+                dtype=latents.dtype,
+                device=latents.device,
+            ).view(-1, 1, 1, 1)
+            return torch.zeros_like(latents) + ref_means
+
+    class _LatentsOnlyTransformer(_FakeTransformer):
+        def __call__(self, latents, timestep, instruction_embeds, freqs_real, instruction_attention_mask, **kwargs):
+            return latents
+
+    def run_isolated(transformer_cls, ref_fill_a, seed_a, ref_fill_b, seed_b):
+        pipeline = _make_edit_forward_pipeline()
+        pipeline.transformer = transformer_cls()
+        pipeline.scheduler = _ApplyingScheduler()
+        pipeline.vae = _RefContentVAE()
+        kw = dict(
+            height=64, width=64, num_inference_steps=2, guidance_scale=5.0, guidance_scale_2=2.0, output_type="latent"
+        )
+        req = _wrap_request_batch(
+            [
+                (
+                    edit_prompt("make it winter", "ugly", ref_fill_a),
+                    _sampling(**kw, generator=torch.Generator().manual_seed(seed_a)),
+                ),
+                (
+                    edit_prompt("a dog in a park", "blurry", ref_fill_b),
+                    _sampling(**kw, generator=torch.Generator().manual_seed(seed_b)),
+                ),
+            ]
+        )
+        return pipeline.forward(req)[0].output
+
+    ref_baseline = run_isolated(_RefOnlyTransformer, 0.25, 1, 0.75, 2)
+    assert torch.equal(ref_baseline, run_isolated(_RefOnlyTransformer, 0.25, 1, 0.5, 2))  # B's ref must not affect A
+    assert not torch.equal(
+        ref_baseline, run_isolated(_RefOnlyTransformer, 0.75, 1, 0.75, 2)
+    )  # A's own ref must affect A
+
+    seed_baseline = run_isolated(_LatentsOnlyTransformer, 0.25, 1, 0.75, 2)
+    assert torch.equal(seed_baseline, run_isolated(_LatentsOnlyTransformer, 0.25, 1, 0.75, 999))  # B's seed unaffecting
+    assert not torch.equal(seed_baseline, run_isolated(_LatentsOnlyTransformer, 0.25, 999, 0.75, 2))  # A's own seed
+
+    # RED-arm: confirm real cross-request mixing bugs make the reference-fill
+    # and seed invariance asserts above actually fail, i.e. they are not
+    # vacuous.
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+
+    real_build_ref_latents = BooguImagePipeline._build_ref_latents
+
+    def reversed_build_ref_latents(self, preprocessed_images, num_images_per_prompt, device, generators=None):
+        swapped = list(reversed(preprocessed_images))
+        return real_build_ref_latents(self, swapped, num_images_per_prompt, device, generators)
+
+    monkeypatch.setattr(BooguImagePipeline, "_build_ref_latents", reversed_build_ref_latents)
+    assert not torch.equal(ref_baseline, run_isolated(_RefOnlyTransformer, 0.25, 1, 0.5, 2))
+    monkeypatch.undo()
+
+    real_collate = DiffusionRequestBatch.collate_request_generators
+
+    def reversed_collate(self, num_outputs_per_prompt, default_generator):
+        result = real_collate(self, num_outputs_per_prompt, default_generator)
+        return list(reversed(result)) if isinstance(result, list) and len(result) > 1 else result
+
+    monkeypatch.setattr(DiffusionRequestBatch, "collate_request_generators", reversed_collate)
+    assert not torch.equal(seed_baseline, run_isolated(_LatentsOnlyTransformer, 0.25, 1, 0.75, 999))
 
 
 def test_supports_request_batch_enabled():
