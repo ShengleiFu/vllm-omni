@@ -107,13 +107,10 @@ def get_boogu_image_post_process_func(od_config: OmniDiffusionConfig):
 
 
 def _boogu_batch_compatibility_key(has_reference: bool) -> tuple:
-    """Request-batch isolation key. ``forward`` reads shared shape/guidance fields
-    from the batch's first request, so t2i and ti2i must not share a key: they
-    take structurally different denoise paths (ti2i threads reference latents and
-    can run the double-guidance three-prediction branch). Guidance mode is fully
-    separated by ``RequestBatchSamplingParamsKey`` (including
-    ``guidance_scale_2_provided``), so requests that share this key are safe to
-    co-batch.
+    """Separate T2I and TI2I denoise paths.
+
+    Shared shape/guidance fields, including ``guidance_scale_2_provided``,
+    are checked by ``RequestBatchSamplingParamsKey``.
     """
     if not has_reference:
         return ("boogu_image", "t2i")
