@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -21,6 +24,38 @@ from .rope_real import RotaryPosEmbedReal
 from .schedulers import FlowMatchEulerDiscreteScheduler
 
 logger = init_logger(__name__)
+
+
+def _pack_cfg_conditions(
+    positive_embeds: torch.Tensor,
+    positive_mask: torch.Tensor,
+    negative_embeds: torch.Tensor,
+    negative_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Right-pad complete conditions, with positive then negative batch rows.
+
+    Preview's positive condition already includes the refined AR image tokens.
+    The transformer and RoPE use each row's effective length; valid tokens must
+    form a contiguous prefix. Do not insert padding between text and image tokens.
+    """
+    for embeds, mask in ((positive_embeds, positive_mask), (negative_embeds, negative_mask)):
+        if embeds.ndim != 3 or embeds.shape[0] != 1:
+            raise ValueError("Packed CFG requires single-request conditions of shape [1, T, H]")
+        if mask.shape != embeds.shape[:2] or mask.dtype != torch.bool:
+            raise ValueError("Packed CFG requires boolean attention masks of shape [1, T]")
+        if torch.any(mask[:, 1:] & ~mask[:, :-1]):
+            raise ValueError("Packed CFG requires attention masks with a contiguous valid prefix")
+    if positive_embeds.shape[-1] != negative_embeds.shape[-1]:
+        raise ValueError("Packed CFG condition hidden dimensions must match")
+
+    max_length = max(positive_embeds.shape[1], negative_embeds.shape[1])
+    packed_embeds = positive_embeds.new_zeros((2, max_length, positive_embeds.shape[-1]))
+    packed_mask = positive_mask.new_zeros((2, max_length))
+    for row, (embeds, mask) in enumerate(((positive_embeds, positive_mask), (negative_embeds, negative_mask))):
+        length = embeds.shape[1]
+        packed_embeds[row, :length] = embeds[0]
+        packed_mask[row, :length] = mask[0]
+    return packed_embeds, packed_mask
 
 
 class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
@@ -215,6 +250,17 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         cfg_range_val = extra_args.get("cfg_range", info["cfg_range"])
         cfg_range = float(cfg_range_val[0]), float(cfg_range_val[1])
         num_inference_steps = int(extra_args.get("num_inference_steps", info["num_inference_steps"][0]))
+        cfg_execution_mode = extra_args.get("cfg_execution_mode", "sequential")
+        if cfg_execution_mode not in ("sequential", "packed"):
+            raise ValueError("cfg_execution_mode must be 'sequential' or 'packed'")
+        if cfg_execution_mode == "packed":
+            model_type = getattr(self.config.llm_config, "model_type", "")
+            nested_embedder = getattr(self.gen_transformer.time_caption_embed, "image_embedder", None)
+            if model_type != "mammothmoda2_qwen2_5_vl" or nested_embedder is not None:
+                raise NotImplementedError(
+                    "Packed CFG currently supports MammothModa2-Preview only; "
+                    "use cfg_execution_mode='sequential' for Dev or a nested image embedder"
+                )
 
         negative_cond = info.get("negative_prompt_embeds")
         negative_attention_mask = info.get("negative_prompt_attention_mask")
@@ -358,28 +404,56 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
 
         # Run diffusion loop (CFG supported when text_guidance_scale > 1.0)
         total_steps = max(1, len(scheduler.timesteps))
+        packed_prompt_embeds = None
+        packed_prompt_attention_mask = None
+        if (
+            cfg_execution_mode == "packed"
+            and negative_prompt_embeds is not None
+            and any(cfg_range[0] <= i / total_steps <= cfg_range[1] for i in range(len(scheduler.timesteps)))
+        ):
+            # Conditions do not change between steps. Pack after the full positive
+            # condition has been built so image tokens stay in its valid prefix.
+            packed_prompt_embeds, packed_prompt_attention_mask = _pack_cfg_conditions(
+                prompt_embeds,
+                prompt_attention_mask,
+                negative_prompt_embeds,
+                negative_prompt_attention_mask,
+            )
         for i, t in enumerate(scheduler.timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
-            model_pred = self.gen_transformer(
-                hidden_states=latents,
-                timestep=timestep,
-                text_hidden_states=prompt_embeds,
-                text_attention_mask=prompt_attention_mask,
-                ref_image_hidden_states=None,
-                ar_image_hidden_states=ar_image_embeds,
-                ar_image_attention_mask=ar_image_attention_mask,
-                freqs_cis=self.gen_freqs_cis,
-            )
             guidance_scale = text_guidance_scale if cfg_range[0] <= i / total_steps <= cfg_range[1] else 1.0
-            if guidance_scale > 1.0 and negative_prompt_embeds is not None:
-                model_pred_uncond = self.gen_transformer(
-                    hidden_states=latents,
-                    timestep=timestep,
-                    text_hidden_states=negative_prompt_embeds,
-                    text_attention_mask=negative_prompt_attention_mask,
+            cfg_active = guidance_scale > 1.0 and negative_prompt_embeds is not None
+            if cfg_active and cfg_execution_mode == "packed":
+                packed_pred = self.gen_transformer(
+                    hidden_states=torch.cat([latents, latents], dim=0),
+                    timestep=torch.cat([timestep, timestep], dim=0),
+                    text_hidden_states=packed_prompt_embeds,
+                    text_attention_mask=packed_prompt_attention_mask,
                     ref_image_hidden_states=None,
                     freqs_cis=self.gen_freqs_cis,
                 )
+                model_pred, model_pred_uncond = packed_pred.chunk(2, dim=0)
+            else:
+                model_pred = self.gen_transformer(
+                    hidden_states=latents,
+                    timestep=timestep,
+                    text_hidden_states=prompt_embeds,
+                    text_attention_mask=prompt_attention_mask,
+                    ref_image_hidden_states=None,
+                    ar_image_hidden_states=ar_image_embeds,
+                    ar_image_attention_mask=ar_image_attention_mask,
+                    freqs_cis=self.gen_freqs_cis,
+                )
+                if cfg_active:
+                    model_pred_uncond = self.gen_transformer(
+                        hidden_states=latents,
+                        timestep=timestep,
+                        text_hidden_states=negative_prompt_embeds,
+                        text_attention_mask=negative_prompt_attention_mask,
+                        ref_image_hidden_states=None,
+                        freqs_cis=self.gen_freqs_cis,
+                    )
+            if cfg_active:
                 model_pred = model_pred_uncond + guidance_scale * (model_pred - model_pred_uncond)
             latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
             latents = latents.to(dtype=prompt_embeds.dtype)

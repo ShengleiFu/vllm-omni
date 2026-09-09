@@ -269,7 +269,7 @@ def test_ltx_reference_image_size_policy(tmp_path, model_version: str, expected:
 
 
 def test_reference_image_size_policy_threads_revision(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured = {}
+    captured: dict[str, Any] = {}
 
     def fake_policy(*, model, revision=None):
         captured.update(model=model, revision=revision)
@@ -603,6 +603,7 @@ def test_mammothmoda2_extra_registry_declares_request_and_response_params() -> N
             {
                 "text_guidance_scale",
                 "cfg_range",
+                "cfg_execution_mode",
                 "num_inference_steps",
             }
         )

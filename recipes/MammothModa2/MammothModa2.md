@@ -20,7 +20,7 @@ pipeline-declared `extra_body` contract.
 
 MammothModa2's DiT stage consumes its inputs through the multi-stage kwargs
 interface (not `OmniDiffusionRequest`), so its generation knobs
-(`text_guidance_scale`, `cfg_range`, `num_inference_steps`) are passed via
+(`text_guidance_scale`, `cfg_range`, `cfg_execution_mode`, `num_inference_steps`) are passed via
 `--extra-body` rather than the standard `--num-inference-steps` / `--cfg-scale`
 flags. Image size uses the standard `--height` / `--width` flags.
 
@@ -99,6 +99,8 @@ so unknown keys for MammothModa2 are silently dropped:
   (default `9.0`; CFG is active only when `> 1.0`).
 - `cfg_range` — relative step range `[start, end]` over which CFG is applied
   (default `[0.0, 1.0]`).
+- `cfg_execution_mode` — `"sequential"` (default) or opt-in `"packed"` for Preview;
+  see [Opt-in packed CFG for Preview](#opt-in-packed-cfg-for-preview).
 - `num_inference_steps` — number of DiT denoising steps (default `50`).
 
 `--height` and `--width` must be multiples of 16.
@@ -169,6 +171,38 @@ python3 examples/offline_inference/text_to_image/text_to_image.py \
 The first request took 85.224 seconds. The AR stage generated 4,161 visual tokens in 72.996 seconds, and the DiT stage took 12.163 seconds. AR weight loading used 21.4 GiB and took 8.250 seconds. DiT weight loading used 5.49 GiB and took 1.824 seconds. The largest one second whole device memory sample was 106.57 GiB, including the AR KV cache reserved by the 0.5 memory setting.
 
 The output was a valid 1024 by 1024 RGB PNG.
+
+## Opt-in packed CFG for Preview
+
+Preview can execute its positive and negative CFG branches in one internal
+batch. To enable it in the Preview command above, use this `--extra-body` value:
+
+```json
+{
+  "cfg_execution_mode": "packed",
+  "text_guidance_scale": 4.0,
+  "cfg_range": [0.0, 1.0],
+  "num_inference_steps": 50
+}
+```
+
+Omitting `cfg_execution_mode`, or setting it to `"sequential"`, retains the
+sequential reference. Packed execution applies only when guidance is active:
+the scale is greater than 1 and the step fraction `i / num_steps` is within
+the inclusive `cfg_range`. Other steps use one positive-branch forward. A
+range that covers no actual step, such as `[1.0, 1.0]`, does not pack conditions.
+
+The initial evaluation scope is MammothModa2-Preview text-to-image with one
+request, one DiT device, eager execution, and diffusion caching disabled.
+The two internal branch rows belong to the same request. Dev and nested image
+embedders are explicitly unsupported in packed mode and raise an error; use
+`"sequential"` for Dev. Other execution combinations need separate qualification.
+
+BF16 packed execution can produce different latent trajectories and generated
+images from sequential execution, including with the same seed. Evaluate the
+generated results and memory use on your target workload before choosing this
+mode. No image-quality acceptance threshold or performance gain is established
+by enabling the option.
 
 ## MammothModa2-Dev unified inference
 
