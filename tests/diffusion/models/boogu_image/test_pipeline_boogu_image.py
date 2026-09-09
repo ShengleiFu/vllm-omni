@@ -1377,6 +1377,43 @@ def test_pre_process_key_wiring_t2i_and_ti2i_batch(tmp_path):
     assert t2i_a != ti2i_a
 
 
+def test_ti2i_batch_key_distinguishes_explicit_image_guidance(tmp_path):
+    import PIL.Image
+
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import get_boogu_image_pre_process_func
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    pre = get_boogu_image_pre_process_func(_make_edit_od_config(tmp_path))
+    image = PIL.Image.new("RGB", (64, 64))
+
+    def make_request(guidance_scale_2: float | None) -> OmniDiffusionRequest:
+        request = OmniDiffusionRequest(
+            prompt={"prompt": "edit", "multi_modal_data": {"image": image}},
+            sampling_params=OmniDiffusionSamplingParams(
+                height=512,
+                width=512,
+                seed=123,
+                guidance_scale=2.0,
+                guidance_scale_2=guidance_scale_2,
+            ),
+            request_id="ti2i",
+        )
+        pre(request)
+        return request
+
+    omitted = build_request_batch_sampling_params_key(make_request(None))
+    explicit = build_request_batch_sampling_params_key(make_request(2.0))
+
+    # Omission auto-fills the same value but must not enable Boogu's image-guidance branch.
+    assert omitted.condition_key == explicit.condition_key == ("boogu_image", "ti2i")
+    assert omitted.guidance_scale_2 == explicit.guidance_scale_2 == 2.0
+    assert omitted.guidance_scale_2_provided is False
+    assert explicit.guidance_scale_2_provided is True
+    assert omitted != explicit
+
+
 class _GeneratorRecordingVAE:
     """Fake VAE that records the generator passed to each latent ``sample()``."""
 
