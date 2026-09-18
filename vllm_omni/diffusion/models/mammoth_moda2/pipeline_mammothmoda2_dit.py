@@ -316,6 +316,32 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                     f"Packed CFG currently supports MammothModa2-Preview only, for request {request_id}; "
                     "use cfg_execution_mode='sequential' for Dev or a nested image embedder"
                 )
+            if not self.od_config.enforce_eager:
+                raise NotImplementedError(
+                    f"Packed CFG is only qualified under eager execution, for request {request_id}; "
+                    "set enforce_eager=True or use cfg_execution_mode='sequential' with torch.compile"
+                )
+            if self.od_config.cache_backend != "none" or self.od_config.cache_strategy != "none":
+                raise NotImplementedError(
+                    f"Packed CFG is only qualified with diffusion caching disabled, for request {request_id}; "
+                    "set cache_backend='none' or use cfg_execution_mode='sequential'"
+                )
+            parallel_config = self.od_config.parallel_config
+            if any(
+                getattr(parallel_config, attr, 1) not in (None, 1)
+                for attr in (
+                    "pipeline_parallel_size",
+                    "tensor_parallel_size",
+                    "sequence_parallel_size",
+                    "ulysses_degree",
+                    "ring_degree",
+                    "allgather_degree",
+                )
+            ):
+                raise NotImplementedError(
+                    f"Packed CFG is only qualified for single-device execution, for request {request_id}; "
+                    "use cfg_execution_mode='sequential' under parallelism"
+                )
 
         generator = sampling.generator
         if isinstance(generator, list) and len(generator) != 1:

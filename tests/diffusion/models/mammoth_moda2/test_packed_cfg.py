@@ -127,9 +127,29 @@ class _VAE(nn.Module):
         return (latents,)
 
 
+def _default_parallel_config():
+    return SimpleNamespace(
+        pipeline_parallel_size=1,
+        tensor_parallel_size=1,
+        sequence_parallel_size=None,
+        ulysses_degree=1,
+        ring_degree=1,
+        allgather_degree=1,
+    )
+
+
 @pytest.fixture
 def pipeline_factory(monkeypatch):
-    def build(*, refined=False, model_type="mammothmoda2_qwen2_5_vl", nested=False):
+    def build(
+        *,
+        refined=False,
+        model_type="mammothmoda2_qwen2_5_vl",
+        nested=False,
+        enforce_eager=True,
+        cache_backend="none",
+        cache_strategy="none",
+        parallel_config=None,
+    ):
         pipeline = MammothModa2DiTPipeline.__new__(MammothModa2DiTPipeline)
         nn.Module.__init__(pipeline)
         pipeline.config = SimpleNamespace(
@@ -138,6 +158,12 @@ def pipeline_factory(monkeypatch):
             video_token_id=901,
             vision_start_token_id=902,
             vision_end_token_id=903,
+        )
+        pipeline.od_config = SimpleNamespace(
+            enforce_eager=enforce_eager,
+            cache_backend=cache_backend,
+            cache_strategy=cache_strategy,
+            parallel_config=parallel_config or _default_parallel_config(),
         )
         pipeline.gen_transformer = _Transformer(nested=nested)
         pipeline.gen_image_condition_refiner = _ImageRefiner() if refined else None
@@ -313,6 +339,42 @@ def test_invalid_execution_mode_fails_before_transformer(pipeline_factory, mode)
 def test_packed_rejects_unqualified_model_variants(pipeline_factory, model_type, nested):
     pipeline, _ = pipeline_factory(model_type=model_type, nested=nested)
     with pytest.raises(NotImplementedError, match="Preview only"):
+        pipeline.forward(_batch(extra_args={"cfg_execution_mode": "packed"}))
+    assert pipeline.gen_transformer.calls == []
+
+
+def test_packed_rejects_non_eager_execution(pipeline_factory):
+    pipeline, _ = pipeline_factory(enforce_eager=False)
+    with pytest.raises(NotImplementedError, match="eager execution"):
+        pipeline.forward(_batch(extra_args={"cfg_execution_mode": "packed"}))
+    assert pipeline.gen_transformer.calls == []
+
+
+@pytest.mark.parametrize("cache_backend,cache_strategy", [("tea_cache", "none"), ("none", "legacy")])
+def test_packed_rejects_diffusion_caching(pipeline_factory, cache_backend, cache_strategy):
+    pipeline, _ = pipeline_factory(cache_backend=cache_backend, cache_strategy=cache_strategy)
+    with pytest.raises(NotImplementedError, match="caching disabled"):
+        pipeline.forward(_batch(extra_args={"cfg_execution_mode": "packed"}))
+    assert pipeline.gen_transformer.calls == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"pipeline_parallel_size": 2},
+        {"tensor_parallel_size": 2},
+        {"sequence_parallel_size": 2},
+        {"ulysses_degree": 2},
+        {"ring_degree": 2},
+        {"allgather_degree": 2},
+    ],
+)
+def test_packed_rejects_multi_device_parallelism(pipeline_factory, overrides):
+    parallel_config = _default_parallel_config()
+    for key, value in overrides.items():
+        setattr(parallel_config, key, value)
+    pipeline, _ = pipeline_factory(parallel_config=parallel_config)
+    with pytest.raises(NotImplementedError, match="single-device execution"):
         pipeline.forward(_batch(extra_args={"cfg_execution_mode": "packed"}))
     assert pipeline.gen_transformer.calls == []
 

@@ -148,16 +148,17 @@ The standard diffusion request fields are `height`, `width`, `seed`,
 `guidance_scale`, and `num_inference_steps`; use their corresponding CLI flags
 shown above. `--height` and `--width` must be multiples of 16.
 
-`cfg_range` is the only recommended MammothModa2 field in `--extra-body`; it
-sets the relative step range `[start, end]` over which CFG is applied (default
-`[0.0, 1.0]`). For compatibility, `text_guidance_scale` and
-`num_inference_steps` remain accepted `extra_body` aliases and, when non-null,
-take precedence over the standard request fields. Model extras are filtered
-against the declared `extra_body_params` (see
+`cfg_range` and `cfg_execution_mode` are the recommended MammothModa2 fields in
+`--extra-body`. `cfg_range` sets the relative step range `[start, end]` over
+which CFG is applied (default `[0.0, 1.0]`). `cfg_execution_mode` is
+`"sequential"` (default) or opt-in `"packed"` for Preview; see
+[Opt-in packed CFG for Preview](#opt-in-packed-cfg-for-preview). For
+compatibility, `text_guidance_scale` and `num_inference_steps` remain accepted
+`extra_body` aliases and, when non-null, take precedence over the standard
+request fields. Model extras are filtered against the declared
+`extra_body_params` (see
 [`vllm_omni/model_extras/mammothmodal2_preview.py`](../../vllm_omni/model_extras/mammothmodal2_preview.py)),
-so unknown MammothModa2 extras may be dropped. `cfg_execution_mode` is also
-accepted — `"sequential"` (default) or opt-in `"packed"` for Preview; see
-[Opt-in packed CFG for Preview](#opt-in-packed-cfg-for-preview).
+so unknown MammothModa2 extras may be dropped.
 
 Run text-to-text through the shared understanding example. It recognizes the
 MammothModa2 checkpoint and automatically selects `mammoth_moda2_ar.yaml`:
@@ -278,7 +279,7 @@ on the standard flags:
 ```bash
   --guidance-scale 4.0 \
   --num-inference-steps 50 \
-  --extra-body '{"cfg_range": [0.0, 1.0], "cfg_execution_mode": "packed"}' \
+  --extra-body '{"cfg_range": [0.0, 1.0], "cfg_execution_mode": "packed"}'
 ```
 
 Omitting `cfg_execution_mode`, or setting it to `"sequential"`, retains the
